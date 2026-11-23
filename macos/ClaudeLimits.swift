@@ -10,6 +10,7 @@ import SwiftUI
 import Foundation
 import ServiceManagement
 import UserNotifications
+import Charts
 
 let home = ProcessInfo.processInfo.environment["HOME"].map { URL(fileURLWithPath: $0) }
     ?? FileManager.default.homeDirectoryForCurrentUser
@@ -26,6 +27,12 @@ enum Main {
         if args.contains("--statusline") { StatusLine.run(); return }
         if args.contains("--install") { exit(Installer.install() ? 0 : 1) }
         if args.contains("--uninstall") { exit(Installer.uninstall() ? 0 : 1) }
+        if let i = args.firstIndex(of: "--snapshot"), args.index(after: i) < args.endIndex {
+            // Отладка/скриншоты: --snapshot out.png [week] [dark]
+            let rest = Array(args[args.index(after: i)...])
+            MainActor.assumeIsolated { Snapshot.render(to: rest[0], week: rest.contains("week"), dark: rest.contains("dark")) }
+            return
+        }
         ClaudeLimitsApp.main()
     }
 }
@@ -42,6 +49,7 @@ enum StatusLine {
         let rl = json["rate_limits"] as? [String: Any]
 
         if let rl {
+            History.appendIfChanged(new: rl)
             let out: [String: Any] = [
                 "updated_at": Int(Date().timeIntervalSince1970),
                 "rate_limits": rl,
@@ -147,6 +155,111 @@ struct WindowState {
     var remaining: Double { max(0, 100 - used) }
 }
 
+// MARK: - History (~/.claude/limits-history.jsonl)
+// Одна строка на изменение: {"t":<epoch>,"f":<5h %>,"fr":<5h reset>,"w":<7d %>,"wr":<7d reset>}
+
+let historyURL = claudeDir.appendingPathComponent("limits-history.jsonl")
+
+struct Sample: Decodable {
+    let t: Double
+    let f: Double?
+    let fr: Double?
+    let w: Double?
+    let wr: Double?
+}
+
+enum WindowKind: String, CaseIterable, Identifiable {
+    case fiveHour, week
+    var id: String { rawValue }
+    var duration: TimeInterval { self == .fiveHour ? 5 * 3600 : 7 * 86400 }
+}
+
+enum History {
+    static let keepDays: Double = 8
+    static let maxBytes = 512 * 1024
+
+    private static func used(_ rl: [String: Any]?, _ k: String) -> Double? {
+        ((rl?[k] as? [String: Any])?["used_percentage"] as? NSNumber)?.doubleValue
+    }
+    private static func reset(_ rl: [String: Any]?, _ k: String) -> Double? {
+        ((rl?[k] as? [String: Any])?["resets_at"] as? NSNumber)?.doubleValue
+    }
+
+    /// Вызывается из --statusline до перезаписи limits.json: дописывает строку, только если проценты изменились.
+    static func appendIfChanged(new rl: [String: Any]) {
+        let old = (try? Data(contentsOf: limitsURL))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let oldRL = old?["rate_limits"] as? [String: Any]
+        let hasHistory = FileManager.default.fileExists(atPath: historyURL.path)
+        let changed = used(oldRL, "five_hour") != used(rl, "five_hour")
+            || used(oldRL, "seven_day") != used(rl, "seven_day")
+        guard changed || !hasHistory else { return }
+
+        var s: [String: Any] = ["t": Int(Date().timeIntervalSince1970)]
+        if let v = used(rl, "five_hour") { s["f"] = v }
+        if let v = reset(rl, "five_hour") { s["fr"] = v }
+        if let v = used(rl, "seven_day") { s["w"] = v }
+        if let v = reset(rl, "seven_day") { s["wr"] = v }
+        guard var line = try? JSONSerialization.data(withJSONObject: s) else { return }
+        line.append(0x0A)
+
+        if let h = try? FileHandle(forWritingTo: historyURL) {
+            h.seekToEndOfFile(); h.write(line); try? h.close()
+        } else {
+            try? line.write(to: historyURL)
+        }
+        pruneIfLarge()
+    }
+
+    private static func pruneIfLarge() {
+        let size = (try? FileManager.default.attributesOfItem(atPath: historyURL.path)[.size] as? Int) ?? 0
+        guard size > maxBytes, let text = try? String(contentsOf: historyURL, encoding: .utf8) else { return }
+        let cutoff = Date().timeIntervalSince1970 - keepDays * 86400
+        let kept = text.split(separator: "\n").filter { line in
+            guard let d = line.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let t = (o["t"] as? NSNumber)?.doubleValue else { return false }
+            return t >= cutoff
+        }
+        try? (kept.joined(separator: "\n") + "\n").write(to: historyURL, atomically: true, encoding: .utf8)
+    }
+
+    static func load() -> [Sample] {
+        guard let text = try? String(contentsOf: historyURL, encoding: .utf8) else { return [] }
+        let dec = JSONDecoder()
+        return text.split(separator: "\n").compactMap { try? dec.decode(Sample.self, from: Data($0.utf8)) }
+    }
+}
+
+struct ChartPoint: Identifiable {
+    let id = UUID()
+    let date: Date
+    let used: Double
+}
+
+/// Точки графика для текущего окна: от начала окна (0%) через историю к «сейчас».
+func chartPoints(kind: WindowKind, state: WindowState, history: [Sample], now: Date = Date()) -> [ChartPoint] {
+    let start = state.resetsAt.addingTimeInterval(-kind.duration)
+    var pts = [ChartPoint(date: start, used: 0)]
+    for s in history {
+        let t = Date(timeIntervalSince1970: s.t)
+        guard t >= start, t <= now, let v = (kind == .fiveHour ? s.f : s.w) else { continue }
+        pts.append(ChartPoint(date: t, used: v))
+    }
+    pts.append(ChartPoint(date: now, used: state.used))
+    return pts
+}
+
+/// Прогноз по среднему темпу с начала окна: когда расход дойдёт до 100% (nil — хватит до сброса).
+func forecastRunOut(kind: WindowKind, state: WindowState, now: Date = Date()) -> Date? {
+    let start = state.resetsAt.addingTimeInterval(-kind.duration)
+    let elapsed = now.timeIntervalSince(start)
+    guard elapsed > 300, state.used > 0 else { return nil }
+    let rate = state.used / elapsed                  // % в секунду
+    let t100 = now.addingTimeInterval((100 - state.used) / rate)
+    return t100 < state.resetsAt ? t100 : nil
+}
+
 // MARK: - Localization
 
 enum AppLanguage: String, CaseIterable, Identifiable {
@@ -198,6 +311,24 @@ struct L10n {
     func updated(_ date: Date) -> String {
         let rel = date.formatted(.relative(presentation: .named).locale(locale))
         return ru ? "Обновлено \(rel)" : "Updated \(rel)"
+    }
+
+    // График
+    var tab5h: String   { ru ? "5 часов" : "5 hours" }
+    var tabWeek: String { ru ? "Неделя" : "Week" }
+    var chartNoData: String { ru ? "Окно сбросилось. График появится после следующего ответа Claude Code."
+                                 : "The window has reset. The chart will appear after Claude Code's next reply." }
+    func forecastRunOut(_ d: Date, week: Bool) -> String {
+        let f: Date.FormatStyle = week ? .dateTime.weekday(.abbreviated).hour().minute() : .dateTime.hour().minute()
+        let s = d.formatted(f.locale(locale))
+        return ru ? "Прогноз: при таком темпе лимит закончится \(week ? "" : "в ")\(s)"
+                  : "Forecast: at this pace you'll hit the limit at \(s)"
+    }
+    var forecastOK: String { ru ? "Прогноз: при таком темпе лимита хватит до сброса"
+                                : "Forecast: at this pace the limit will last until reset" }
+    func hoverLabel(_ used: Double, _ d: Date, week: Bool) -> String {
+        let f: Date.FormatStyle = week ? .dateTime.weekday(.abbreviated).hour().minute() : .dateTime.hour().minute()
+        return "\(Int(used.rounded()))% · \(d.formatted(f.locale(locale)))"
     }
 
     // Уведомления
@@ -299,6 +430,10 @@ final class LimitsStore: ObservableObject {
     @Published var fiveHour: WindowState?
     @Published var sevenDay: WindowState?
     @Published var updatedAt: Date?
+    @Published var history: [Sample] = []
+    @Published var chartKind: WindowKind = .fiveHour
+    let hover = HoverModel()
+    private var historyModDate: Date?
     @Published var error: LoadError?
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var language: AppLanguage {
@@ -331,6 +466,10 @@ final class LimitsStore: ObservableObject {
     }
 
     func reload() {
+        // История перечитывается только когда файл изменился
+        let mod = (try? FileManager.default.attributesOfItem(atPath: historyURL.path)[.modificationDate]) as? Date
+        if mod != historyModDate { historyModDate = mod; history = History.load() }
+
         guard let data = try? Data(contentsOf: limitsURL) else { error = .noFile; return }
         do {
             let f = try JSONDecoder().decode(LimitsFile.self, from: data)
@@ -412,6 +551,117 @@ struct WindowRow: View {
     }
 }
 
+/// Состояние наведения на график (вместо @State — работает и без плагина макросов SwiftUI).
+final class HoverModel: ObservableObject {
+    @Published var point: ChartPoint?
+}
+
+struct UsageChart: View {
+    let kind: WindowKind
+    let state: WindowState?
+    let history: [Sample]
+    let l: L10n
+    @ObservedObject var hoverModel: HoverModel
+
+    var body: some View {
+        if let s = state, s.resetsAt > Date() {
+            let now = Date()
+            let week = kind == .week
+            let start = s.resetsAt.addingTimeInterval(-kind.duration)
+            let pts = chartPoints(kind: kind, state: s, history: history, now: now)
+            let runOut = forecastRunOut(kind: kind, state: s, now: now)
+            let elapsed = now.timeIntervalSince(start)
+            let rate = elapsed > 300 ? s.used / elapsed : 0
+            let projEnd = runOut ?? s.resetsAt
+            let projVal = runOut != nil ? 100 : min(100, s.used + rate * s.resetsAt.timeIntervalSince(now))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Chart {
+                    ForEach(pts) { p in
+                        AreaMark(x: .value("t", p.date), y: .value("%", p.used))
+                            .interpolationMethod(.stepEnd)
+                            .foregroundStyle(Color.accentColor.opacity(0.15))
+                        LineMark(x: .value("t", p.date), y: .value("%", p.used), series: .value("s", "used"))
+                            .interpolationMethod(.stepEnd)
+                            .foregroundStyle(Color.accentColor)
+                            .lineStyle(StrokeStyle(lineWidth: 2))
+                    }
+                    if rate > 0 {
+                        // Прогноз — пунктир от «сейчас»
+                        LineMark(x: .value("t", now), y: .value("%", s.used), series: .value("s", "forecast"))
+                            .foregroundStyle(Color.secondary)
+                            .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                        LineMark(x: .value("t", projEnd), y: .value("%", projVal), series: .value("s", "forecast"))
+                            .foregroundStyle(Color.secondary)
+                            .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                    }
+                    RuleMark(y: .value("limit", 100))
+                        .foregroundStyle(Color.red.opacity(0.35))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                    if let h = hoverModel.point {
+                        RuleMark(x: .value("t", h.date))
+                            .foregroundStyle(Color.secondary.opacity(0.5))
+                        PointMark(x: .value("t", h.date), y: .value("%", h.used))
+                            .symbolSize(50)
+                            .foregroundStyle(Color.accentColor)
+                            .annotation(position: .top, alignment: .center, spacing: 4) {
+                                Text(l.hoverLabel(h.used, h.date, week: week))
+                                    .font(.caption2.monospacedDigit())
+                                    .padding(.horizontal, 5).padding(.vertical, 2)
+                                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 4))
+                            }
+                    }
+                }
+                .chartXScale(domain: start...s.resetsAt)
+                .chartYScale(domain: 0...100)
+                .chartYAxis {
+                    AxisMarks(position: .leading, values: [0, 50, 100]) { v in
+                        AxisGridLine().foregroundStyle(Color.secondary.opacity(0.2))
+                        AxisValueLabel { Text("\(v.as(Int.self) ?? 0)%").font(.caption2) }
+                    }
+                }
+                .chartXAxis {
+                    AxisMarks(values: .stride(by: week ? .day : .hour)) { _ in
+                        AxisGridLine().foregroundStyle(Color.secondary.opacity(0.15))
+                        AxisValueLabel(format: week ? .dateTime.weekday(.abbreviated) : .dateTime.hour())
+                            .font(.caption2)
+                    }
+                }
+                .chartOverlay { proxy in
+                    GeometryReader { geo in
+                        Rectangle().fill(.clear).contentShape(Rectangle())
+                            .onContinuousHover { phase in
+                                switch phase {
+                                case .active(let loc):
+                                    let x = loc.x - geo[proxy.plotAreaFrame].origin.x
+                                    if let d: Date = proxy.value(atX: x), d >= start, d <= now {
+                                        // ступенчатый график: последнее значение не позже d
+                                        let v = pts.last(where: { $0.date <= d })?.used ?? 0
+                                        hoverModel.point = ChartPoint(date: d, used: v)
+                                    } else {
+                                        hoverModel.point = nil
+                                    }
+                                case .ended:
+                                    hoverModel.point = nil
+                                }
+                            }
+                    }
+                }
+                .frame(height: 130)
+
+                if rate > 0 {
+                    Text(runOut.map { l.forecastRunOut($0, week: week) } ?? l.forecastOK)
+                        .font(.caption)
+                        .foregroundStyle(runOut == nil ? Color.secondary : color(for: 95))
+                }
+            }
+        } else {
+            Text(l.chartNoData).font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, minHeight: 60, alignment: .center)
+        }
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: LimitsStore
 
@@ -426,6 +676,17 @@ struct PopoverView: View {
             case nil:
                 WindowRow(title: l.fiveHour, state: store.fiveHour, l: l)
                 WindowRow(title: l.week, state: store.sevenDay, l: l)
+
+                Picker("", selection: $store.chartKind) {
+                    Text(l.tab5h).tag(WindowKind.fiveHour)
+                    Text(l.tabWeek).tag(WindowKind.week)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                UsageChart(kind: store.chartKind,
+                           state: store.chartKind == .fiveHour ? store.fiveHour : store.sevenDay,
+                           history: store.history, l: l, hoverModel: store.hover)
             }
 
             Divider()
@@ -455,7 +716,7 @@ struct PopoverView: View {
             }
         }
         .padding(16)
-        .frame(width: 300)
+        .frame(width: 340)
         .environment(\.locale, l.locale)
     }
 }
@@ -473,5 +734,26 @@ struct ClaudeLimitsApp: App {
             }
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+
+// MARK: - Snapshot (PNG окна для README / отладки)
+
+@MainActor
+enum Snapshot {
+    static func render(to path: String, week: Bool, dark: Bool) {
+        let store = LimitsStore()
+        store.chartKind = week ? .week : .fiveHour
+        let view = PopoverView(store: store)
+            .background(dark ? Color(white: 0.15) : Color(white: 0.97))
+            .environment(\.colorScheme, dark ? .dark : .light)
+        let r = ImageRenderer(content: view)
+        r.scale = 2
+        guard let img = r.nsImage, let tiff = img.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { print("render failed"); return }
+        try? png.write(to: URL(fileURLWithPath: path))
+        print("saved \(path)")
     }
 }

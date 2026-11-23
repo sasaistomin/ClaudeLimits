@@ -8,5 +8,5 @@ if [ -x "$APP/Contents/MacOS/ClaudeLimits" ]; then
   "$APP/Contents/MacOS/ClaudeLimits" --uninstall || true
 fi
 rm -rf "$APP"
-rm -f "$HOME/.claude/limits.json"
+rm -f "$HOME/.claude/limits.json" "$HOME/.claude/limits-history.jsonl"
 echo "ClaudeLimits удалён."

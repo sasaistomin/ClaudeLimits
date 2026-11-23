@@ -21,6 +21,7 @@ if (Test-Path $Settings) {
 }
 
 Remove-Item -Force (Join-Path $env:USERPROFILE '.claude\limits.json')
+Remove-Item -Force (Join-Path $env:USERPROFILE '.claude\limits-history.jsonl')
 Set-Location $env:USERPROFILE
 Remove-Item -Recurse -Force $InstallDir
 Write-Host 'ClaudeLimits удалён.'

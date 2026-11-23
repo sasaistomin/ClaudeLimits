@@ -45,6 +45,12 @@ $Strings = @{
         ResetTitle = 'Лимит Claude сброшен'
         ResetBodyFive = '5-часовое окно обновилось — можно работать.'
         ResetBodyWeek = 'Недельный лимит обновился — можно работать.'
+        Chart = 'График использования…'; ChartTitle = 'Лимиты Claude — график'
+        Tab5h = '5 часов'; TabWeek = 'Неделя'; Culture = 'ru-RU'
+        ChartNoData = 'Окно сбросилось. График появится после следующего ответа Claude Code.'
+        ForecastAt5 = 'Прогноз: при таком темпе лимит закончится в {0}'
+        ForecastAtWeek = 'Прогноз: при таком темпе лимит закончится {0}'
+        ForecastOK = 'Прогноз: при таком темпе лимита хватит до сброса'
     }
     en = @{
         Title = 'Claude Limits'; Five = '5 hours'; Week = 'Weekly'
@@ -63,6 +69,12 @@ $Strings = @{
         ResetTitle = 'Claude limit has reset'
         ResetBodyFive = "The 5-hour window has reset — you're good to go."
         ResetBodyWeek = "The weekly limit has reset — you're good to go."
+        Chart = 'Usage chart…'; ChartTitle = 'Claude Limits — chart'
+        Tab5h = '5 hours'; TabWeek = 'Week'; Culture = 'en-US'
+        ChartNoData = "The window has reset. The chart will appear after Claude Code's next reply."
+        ForecastAt5 = "Forecast: at this pace you'll hit the limit at {0}"
+        ForecastAtWeek = "Forecast: at this pace you'll hit the limit at {0}"
+        ForecastOK = 'Forecast: at this pace the limit will last until reset'
     }
 }
 
@@ -214,6 +226,212 @@ function Set-TrayIcon([string]$text, [System.Drawing.Color]$bg) {
     $script:lastHIcon = $hIcon
 }
 
+# ---------- окно с графиком ----------
+
+$HistoryFile = Join-Path $env:USERPROFILE '.claude\limits-history.jsonl'
+$script:ChartCtl = $null
+$script:ChartModel = $null
+$script:ChartKind = 'five'
+$script:HoverX = -1
+$AccentColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+
+function Read-History {
+    if (-not (Test-Path $HistoryFile)) { return @() }
+    try {
+        $lines = @([IO.File]::ReadAllLines($HistoryFile) | Where-Object { $_.Trim() })
+        if ($lines.Count -eq 0) { return @() }
+        return @(('[' + ($lines -join ',') + ']') | ConvertFrom-Json)
+    } catch { return @() }
+}
+
+function ConvertTo-LocalTime([int64]$t) { [DateTimeOffset]::FromUnixTimeSeconds($t).LocalDateTime }
+
+# Точки текущего окна: от начала окна (0%) через историю к «сейчас» + прогноз по среднему темпу
+function Get-ChartModel {
+    $l = Get-Limits
+    $five = $script:ChartKind -eq 'five'
+    $w = $null
+    if ($l) { $w = if ($five) { $l.Five } else { $l.Week } }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if (-not $w -or $w.Reset -le $now) { return $null }
+    $dur = if ($five) { 5 * 3600 } else { 7 * 86400 }
+    $start = $w.Reset - $dur
+    $pts = New-Object System.Collections.ArrayList
+    [void]$pts.Add(@([int64]$start, 0.0))
+    foreach ($s in (Read-History)) {
+        $v = if ($five) { $s.f } else { $s.w }
+        if ($null -ne $v -and [int64]$s.t -ge $start -and [int64]$s.t -le $now) { [void]$pts.Add(@([int64]$s.t, [double]$v)) }
+    }
+    [void]$pts.Add(@([int64]$now, [double]$w.Used))
+    $elapsed = $now - $start
+    $rate = 0.0
+    if ($elapsed -gt 300 -and $w.Used -gt 0) { $rate = $w.Used / $elapsed }
+    $runOut = $null
+    if ($rate -gt 0) {
+        $t100 = $now + (100 - $w.Used) / $rate
+        if ($t100 -lt $w.Reset) { $runOut = [int64]$t100 }
+    }
+    return @{ Five = $five; Start = [int64]$start; End = [int64]$w.Reset; Now = [int64]$now; Used = [double]$w.Used
+              Points = $pts; Rate = $rate; RunOut = $runOut }
+}
+
+function Draw-Chart($g, [int]$W, [int]$H) {
+    $g.SmoothingMode = 'AntiAlias'
+    $g.Clear([System.Drawing.Color]::White)
+    $m = $script:ChartModel
+    if (-not $m) { return }
+
+    $L = 40; $R = $W - 12; $Tp = 12; $B = $H - 24
+    $span = [double]($m.End - $m.Start)
+    $xOf = { param($t) [single]($L + ($t - $m.Start) / $span * ($R - $L)) }
+    $yOf = { param($v) [single]($B - $v / 100.0 * ($B - $Tp)) }
+    $culture = [Globalization.CultureInfo]::GetCultureInfo($script:T.Culture)
+    $font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $inkMuted = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(110, 110, 110))
+    $gridPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(230, 230, 230), 1)
+    $limitPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 220, 53, 69), 1)
+    $limitPen.DashStyle = 'Dash'
+
+    # Ось Y: 0 / 50 / 100 %
+    $sfR = New-Object System.Drawing.StringFormat; $sfR.Alignment = 'Far'; $sfR.LineAlignment = 'Center'
+    foreach ($v in @(0, 50, 100)) {
+        $y = & $yOf $v
+        $pen = if ($v -eq 100) { $limitPen } else { $gridPen }
+        $g.DrawLine($pen, $L, $y, $R, $y)
+        $g.DrawString("$v%", $font, $inkMuted, (New-Object System.Drawing.RectangleF(0, ($y - 8), ($L - 4), 16)), $sfR)
+    }
+
+    # Ось X: часы (5 ч) или дни (неделя)
+    $sfC = New-Object System.Drawing.StringFormat; $sfC.Alignment = 'Center'
+    $d0 = ConvertTo-LocalTime $m.Start
+    if ($m.Five) { $d = $d0.Date.AddHours($d0.Hour + 1); $step = { param($x) $x.AddHours(1) } }
+    else         { $d = $d0.Date.AddDays(1);              $step = { param($x) $x.AddDays(1) } }
+    while ($true) {
+        $t = ([DateTimeOffset]$d).ToUnixTimeSeconds()
+        if ($t -ge $m.End) { break }
+        $x = & $xOf $t
+        $g.DrawLine($gridPen, $x, $Tp, $x, $B)
+        if ($m.Five) { $label = $d.ToString('HH', $culture); $lx = $x }
+        else { $label = $d.ToString('ddd', $culture); $lx = [math]::Min($R - 10, (& $xOf ($t + 43200))) }
+        $g.DrawString($label, $font, $inkMuted, (New-Object System.Drawing.RectangleF(($lx - 20), ($B + 4), 40, 16)), $sfC)
+        $d = & $step $d
+    }
+
+    # Ступенчатая линия расхода + заливка
+    $pts = $m.Points
+    $line = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    for ($i = 0; $i -lt $pts.Count; $i++) {
+        $x = & $xOf $pts[$i][0]; $y = & $yOf $pts[$i][1]
+        if ($i -gt 0) { $line.Add((New-Object System.Drawing.PointF($x, $line[$line.Count - 1].Y))) }
+        $line.Add((New-Object System.Drawing.PointF($x, $y)))
+    }
+    $area = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]' (, $line)
+    $area.Add((New-Object System.Drawing.PointF($line[$line.Count - 1].X, $B)))
+    $area.Add((New-Object System.Drawing.PointF($line[0].X, $B)))
+    $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(45, $AccentColor))
+    $g.FillPolygon($fill, $area.ToArray())
+    $linePen = New-Object System.Drawing.Pen($AccentColor, 2)
+    $g.DrawLines($linePen, $line.ToArray())
+
+    # Прогноз — пунктир от «сейчас»
+    if ($m.Rate -gt 0) {
+        if ($m.RunOut) { $endT = $m.RunOut; $endV = 100 }
+        else { $endT = $m.End; $endV = [math]::Min(100, $m.Used + $m.Rate * ($m.End - $m.Now)) }
+        $fcPen = New-Object System.Drawing.Pen([System.Drawing.Color]::Gray, 1.5)
+        $fcPen.DashStyle = 'Dash'
+        $g.DrawLine($fcPen, (& $xOf $m.Now), (& $yOf $m.Used), (& $xOf $endT), (& $yOf $endV))
+        $fcPen.Dispose()
+    }
+
+    # Наведение мышью: значение в выбранный момент
+    $hx = $script:HoverX
+    $xNow = & $xOf $m.Now
+    if ($hx -ge $L -and $hx -le $xNow) {
+        $t = $m.Start + ($hx - $L) / [double]($R - $L) * $span
+        $v = 0.0
+        foreach ($p in $pts) { if ($p[0] -le $t) { $v = $p[1] } }
+        $hy = & $yOf $v
+        $g.DrawLine($gridPen, $hx, $Tp, $hx, $B)
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush($AccentColor)), ($hx - 4), ($hy - 4), 8, 8)
+        $fmt = if ($m.Five) { 'HH:mm' } else { 'ddd HH:mm' }
+        $txt = '{0}% · {1}' -f [math]::Round($v), (ConvertTo-LocalTime ([int64]$t)).ToString($fmt, $culture)
+        $sz = $g.MeasureString($txt, $font)
+        $bx = [math]::Min($R - $sz.Width - 6, [math]::Max($L, $hx - $sz.Width / 2 - 3))
+        $by = [math]::Max(0, $hy - $sz.Height - 10)
+        $g.FillRectangle([System.Drawing.Brushes]::White, $bx, $by, ($sz.Width + 6), ($sz.Height + 2))
+        $g.DrawRectangle($gridPen, $bx, $by, ($sz.Width + 6), ($sz.Height + 2))
+        $g.DrawString($txt, $font, [System.Drawing.Brushes]::Black, ($bx + 3), ($by + 1))
+    }
+
+    $font.Dispose(); $inkMuted.Dispose(); $gridPen.Dispose(); $limitPen.Dispose(); $fill.Dispose(); $linePen.Dispose()
+}
+
+function Update-Chart {
+    $c = $script:ChartCtl
+    if (-not $c -or $c.Form.IsDisposed) { return }
+    $T = $script:T
+    $five = $script:ChartKind -eq 'five'
+    $c.Form.Text = $T.ChartTitle
+    $c.B5.Text = $T.Tab5h; $c.BW.Text = $T.TabWeek
+    $c.B5.Font = New-Object System.Drawing.Font($c.Form.Font, $(if ($five) { 'Bold' } else { 'Regular' }))
+    $c.BW.Font = New-Object System.Drawing.Font($c.Form.Font, $(if ($five) { 'Regular' } else { 'Bold' }))
+
+    $script:ChartModel = Get-ChartModel
+    $m = $script:ChartModel
+    $c.Lbl.ForeColor = [System.Drawing.Color]::DimGray
+    if (-not $m) {
+        $c.Lbl.Text = $T.ChartNoData
+    } elseif ($m.Rate -le 0) {
+        $c.Lbl.Text = ''
+    } elseif ($m.RunOut) {
+        $culture = [Globalization.CultureInfo]::GetCultureInfo($T.Culture)
+        $fmt = if ($five) { 'HH:mm' } else { 'ddd HH:mm' }
+        $when = (ConvertTo-LocalTime $m.RunOut).ToString($fmt, $culture)
+        $c.Lbl.Text = $(if ($five) { $T.ForecastAt5 } else { $T.ForecastAtWeek }) -f $when
+        $c.Lbl.ForeColor = [System.Drawing.Color]::FromArgb(200, 40, 50)
+    } else {
+        $c.Lbl.Text = $T.ForecastOK
+    }
+    $c.Pic.Invalidate()
+}
+
+function Show-ChartForm {
+    if ($script:ChartCtl -and -not $script:ChartCtl.Form.IsDisposed) { $script:ChartCtl.Form.Activate(); return }
+
+    $f = New-Object System.Windows.Forms.Form
+    $f.ClientSize = New-Object System.Drawing.Size(500, 300)
+    $f.StartPosition = 'CenterScreen'
+    $f.FormBorderStyle = 'FixedSingle'
+    $f.MaximizeBox = $false
+    $f.BackColor = [System.Drawing.Color]::White
+    $f.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+    $b5 = New-Object System.Windows.Forms.Button
+    $b5.Location = New-Object System.Drawing.Point(12, 10); $b5.Size = New-Object System.Drawing.Size(100, 28)
+    $bW = New-Object System.Windows.Forms.Button
+    $bW.Location = New-Object System.Drawing.Point(116, 10); $bW.Size = New-Object System.Drawing.Size(100, 28)
+
+    $pic = New-Object System.Windows.Forms.PictureBox
+    $pic.Location = New-Object System.Drawing.Point(12, 48); $pic.Size = New-Object System.Drawing.Size(476, 210)
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Location = New-Object System.Drawing.Point(12, 264); $lbl.Size = New-Object System.Drawing.Size(476, 32)
+
+    $f.Controls.AddRange(@($b5, $bW, $pic, $lbl))
+    $script:ChartCtl = @{ Form = $f; B5 = $b5; BW = $bW; Pic = $pic; Lbl = $lbl }
+
+    $b5.Add_Click({ $script:ChartKind = 'five'; Update-Chart })
+    $bW.Add_Click({ $script:ChartKind = 'week'; Update-Chart })
+    $pic.Add_Paint({ param($s, $e) try { Draw-Chart $e.Graphics $s.Width $s.Height } catch { } })
+    $pic.Add_MouseMove({ param($s, $e) $script:HoverX = $e.X; $s.Invalidate() })
+    $pic.Add_MouseLeave({ param($s, $e) $script:HoverX = -1; $s.Invalidate() })
+    $f.Add_FormClosed({ $script:ChartCtl = $null })
+
+    Update-Chart
+    $f.Show()
+    $f.Activate()
+}
+
 # ---------- трей и меню ----------
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -228,8 +446,11 @@ $miWeek    = $menu.Items.Add(''); $miWeek.Enabled = $false
 $miWeekR   = $menu.Items.Add(''); $miWeekR.Enabled = $false
 $miUpdated = $menu.Items.Add(''); $miUpdated.Enabled = $false
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+$miChart   = $menu.Items.Add('')
+$miChart.Font = New-Object System.Drawing.Font($miChart.Font, [System.Drawing.FontStyle]::Bold)
+$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $miStartup = $menu.Items.Add('')
-$miNotif   = $menu.Items.Add('')
+$miNotif  = $menu.Items.Add('')
 $miLang   = New-Object System.Windows.Forms.ToolStripMenuItem
 $menu.Items.Add($miLang) | Out-Null
 $miLangSys = $miLang.DropDownItems.Add('')
@@ -243,6 +464,7 @@ $tray.Visible = $true
 function Update-StaticTexts {
     $T = $script:T
     $miTitle.Text   = $T.Title
+    $miChart.Text   = $T.Chart
     $miStartup.Text = $T.Startup
     $miNotif.Text   = $T.Notifications
     $miNotif.Checked = [bool]$script:Config.notifications
@@ -301,7 +523,10 @@ function Set-Language([string]$lang) {
     Save-Config
     Update-StaticTexts
     Update-UI
+    Update-Chart
 }
+
+$miChart.Add_Click({ Show-ChartForm })
 
 $miNotif.Add_Click({
     $script:Config.notifications = -not $script:Config.notifications
@@ -350,7 +575,10 @@ $tray.Add_MouseClick({
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 5000
-$timer.Add_Tick({ try { Update-UI } catch { } })
+$timer.Add_Tick({
+    try { Update-UI } catch { }
+    if ($script:ChartCtl) { try { Update-Chart } catch { } }
+})
 $timer.Start()
 
 Update-StaticTexts
