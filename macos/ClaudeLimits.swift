@@ -9,6 +9,7 @@
 import SwiftUI
 import Foundation
 import ServiceManagement
+import UserNotifications
 
 let home = ProcessInfo.processInfo.environment["HOME"].map { URL(fileURLWithPath: $0) }
     ?? FileManager.default.homeDirectoryForCurrentUser
@@ -199,6 +200,26 @@ struct L10n {
         return ru ? "Обновлено \(rel)" : "Updated \(rel)"
     }
 
+    // Уведомления
+    var notifications: String  { ru ? "Уведомления" : "Notifications" }
+    var notifOnTitle: String   { ru ? "Уведомления включены" : "Notifications are on" }
+    var notifOnBody: String    { ru ? "Сообщу, когда лимит будет заканчиваться и когда он сбросится."
+                                    : "I'll let you know when a limit is running low and when it resets." }
+    func lowTitle(_ left: Int) -> String { ru ? "Claude: осталось \(left)%" : "Claude: \(left)% left" }
+    func lowBody(five: Bool, used: Int, countdown: String) -> String {
+        if ru {
+            return five ? "5-часовое окно израсходовано на \(used)%. Сброс \(countdown)."
+                        : "Недельный лимит израсходован на \(used)%. Сброс \(countdown)."
+        }
+        return five ? "5-hour window is \(used)% used. Resets \(countdown)."
+                    : "Weekly limit is \(used)% used. Resets \(countdown)."
+    }
+    var resetTitle: String { ru ? "Лимит Claude сброшен" : "Claude limit has reset" }
+    func resetBody(five: Bool) -> String {
+        if ru { return five ? "5-часовое окно обновилось — можно работать." : "Недельный лимит обновился — можно работать." }
+        return five ? "The 5-hour window has reset — you're good to go." : "The weekly limit has reset — you're good to go."
+    }
+
     func countdown(to date: Date) -> String {
         let s = Int(date.timeIntervalSinceNow)
         if s <= 0 { return ru ? "сброшен" : "done" }
@@ -206,6 +227,66 @@ struct L10n {
         if d > 0 { return ru ? "через \(d) д \(h) ч" : "in \(d)d \(h)h" }
         if h > 0 { return ru ? "через \(h) ч \(m) мин" : "in \(h)h \(m)m" }
         return ru ? "через \(m) мин" : "in \(m)m"
+    }
+}
+
+// MARK: - Notifications
+
+final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    // Показывать баннер, даже когда приложение «активно»
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler handler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        handler([.banner, .sound])
+    }
+}
+
+let notificationDelegate = NotificationDelegate()
+
+enum Notifier {
+    static let thresholds: [Double] = [95, 80]      // от большего к меньшему
+    static let sameWindowTolerance: Double = 1800   // resets_at может немного «плавать»
+    static let resetGrace: Double = 900             // сообщать о сбросе не позже 15 мин после него
+    static let defaultsKey = "notified"
+
+    static func send(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+
+    static func requestAuthorization(then: (() -> Void)? = nil) {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            if granted { then?() }
+        }
+    }
+
+    /// Проверяет одно окно лимита и при необходимости шлёт уведомление (один раз на окно).
+    static func check(kind: String, window w: Window, l: L10n) {
+        var notified = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double] ?? [:]
+        func already(_ key: String) -> Bool {
+            if let r = notified[key] { return abs(r - w.resets_at) < sameWindowTolerance }
+            return false
+        }
+        let now = Date().timeIntervalSince1970
+        let five = kind == "five_hour"
+
+        if now < w.resets_at {
+            // Наибольший пройденный порог, о котором ещё не сообщали
+            if let th = thresholds.first(where: { w.used_percentage >= $0 }), !already("\(kind):\(Int(th))") {
+                for t in thresholds where t <= th { notified["\(kind):\(Int(t))"] = w.resets_at }
+                let used = Int(w.used_percentage.rounded())
+                send(l.lowTitle(max(0, 100 - used)),
+                     l.lowBody(five: five, used: used,
+                               countdown: l.countdown(to: Date(timeIntervalSince1970: w.resets_at))))
+            }
+        } else if now - w.resets_at < resetGrace, w.used_percentage >= 80, !already("\(kind):reset") {
+            notified["\(kind):reset"] = w.resets_at
+            send(l.resetTitle, l.resetBody(five: five))
+        }
+        UserDefaults.standard.set(notified, forKey: defaultsKey)
     }
 }
 
@@ -224,12 +305,25 @@ final class LimitsStore: ObservableObject {
         didSet { UserDefaults.standard.set(language.rawValue, forKey: "language") }
     }
 
+    @Published var notificationsOn: Bool {
+        didSet {
+            UserDefaults.standard.set(notificationsOn, forKey: "notifications")
+            if notificationsOn {
+                let l = l10n
+                Notifier.requestAuthorization { Notifier.send(l.notifOnTitle, l.notifOnBody) }
+            }
+        }
+    }
+
     var l10n: L10n { L10n(ru: language.resolvedIsRussian) }
 
     private var timer: Timer?
 
     init() {
         language = AppLanguage(rawValue: UserDefaults.standard.string(forKey: "language") ?? "") ?? .system
+        notificationsOn = UserDefaults.standard.object(forKey: "notifications") as? Bool ?? true
+        UNUserNotificationCenter.current().delegate = notificationDelegate
+        if notificationsOn { Notifier.requestAuthorization() }
         reload()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reload() }
@@ -244,6 +338,10 @@ final class LimitsStore: ObservableObject {
             updatedAt = Date(timeIntervalSince1970: f.updated_at)
             fiveHour = Self.state(f.rate_limits.five_hour)
             sevenDay = Self.state(f.rate_limits.seven_day)
+            if notificationsOn {
+                if let w = f.rate_limits.five_hour { Notifier.check(kind: "five_hour", window: w, l: l10n) }
+                if let w = f.rate_limits.seven_day { Notifier.check(kind: "seven_day", window: w, l: l10n) }
+            }
         } catch {
             self.error = .badFile
         }
@@ -337,6 +435,9 @@ struct PopoverView: View {
                 set: { store.setLaunchAtLogin($0) }
             ))
             .toggleStyle(.checkbox)
+
+            Toggle(l.notifications, isOn: $store.notificationsOn)
+                .toggleStyle(.checkbox)
 
             Picker(l.language, selection: $store.language) {
                 ForEach(AppLanguage.allCases) { Text($0.label(l)).tag($0) }

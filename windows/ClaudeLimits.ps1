@@ -37,6 +37,14 @@ $Strings = @{
         Updated = 'Обновлено {0}'; JustNow = 'только что'; MinAgo = '{0} мин назад'; HAgo = '{0} ч назад'; DAgo = '{0} д назад'
         Startup = 'Запускать при входе в Windows'; Language = 'Язык'; System = 'Системный'; Quit = 'Выход'
         TipFive = '5ч'; TipWeek = 'неделя'
+        Notifications = 'Уведомления'
+        NotifOnTitle = 'Уведомления включены'; NotifOnBody = 'Сообщу, когда лимит будет заканчиваться и когда он сбросится.'
+        LowTitle = 'Claude: осталось {0}%'
+        LowBodyFive = '5-часовое окно израсходовано на {0}%. Сброс {1}.'
+        LowBodyWeek = 'Недельный лимит израсходован на {0}%. Сброс {1}.'
+        ResetTitle = 'Лимит Claude сброшен'
+        ResetBodyFive = '5-часовое окно обновилось — можно работать.'
+        ResetBodyWeek = 'Недельный лимит обновился — можно работать.'
     }
     en = @{
         Title = 'Claude Limits'; Five = '5 hours'; Week = 'Weekly'
@@ -47,21 +55,39 @@ $Strings = @{
         Updated = 'Updated {0}'; JustNow = 'just now'; MinAgo = '{0} min ago'; HAgo = '{0} h ago'; DAgo = '{0} d ago'
         Startup = 'Launch at Windows sign-in'; Language = 'Language'; System = 'System'; Quit = 'Quit'
         TipFive = '5h'; TipWeek = 'week'
+        Notifications = 'Notifications'
+        NotifOnTitle = 'Notifications are on'; NotifOnBody = "I'll let you know when a limit is running low and when it resets."
+        LowTitle = 'Claude: {0}% left'
+        LowBodyFive = '5-hour window is {0}% used. Resets {1}.'
+        LowBodyWeek = 'Weekly limit is {0}% used. Resets {1}.'
+        ResetTitle = 'Claude limit has reset'
+        ResetBodyFive = "The 5-hour window has reset — you're good to go."
+        ResetBodyWeek = "The weekly limit has reset — you're good to go."
     }
 }
 
-function Get-LangSetting {
+# ---------- настройки (config.json) ----------
+# { "language": "system|ru|en", "notifications": true, "notified": { "five_hour:80": <resets_at>, ... } }
+
+function Read-Config {
+    $cfg = @{ language = 'system'; notifications = $true; notified = @{} }
     try {
         $c = [IO.File]::ReadAllText($ConfigFile) | ConvertFrom-Json
-        if (@('system', 'ru', 'en') -contains $c.language) { return $c.language }
+        if (@('system', 'ru', 'en') -contains $c.language) { $cfg.language = $c.language }
+        if ($null -ne $c.notifications) { $cfg.notifications = [bool]$c.notifications }
+        if ($c.notified) { foreach ($p in $c.notified.PSObject.Properties) { $cfg.notified[$p.Name] = [double]$p.Value } }
     } catch { }
-    return 'system'
+    return $cfg
 }
 
-function Save-LangSetting([string]$lang) {
-    $json = @{ language = $lang } | ConvertTo-Json
-    [IO.File]::WriteAllText($ConfigFile, $json, (New-Object Text.UTF8Encoding $false))
+function Save-Config {
+    try {
+        $json = $script:Config | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($ConfigFile, $json, (New-Object Text.UTF8Encoding $false))
+    } catch { }
 }
+
+$script:Config = Read-Config
 
 function Resolve-Lang([string]$setting) {
     if ($setting -eq 'system') {
@@ -70,7 +96,7 @@ function Resolve-Lang([string]$setting) {
     return $setting
 }
 
-$script:LangSetting = Get-LangSetting
+$script:LangSetting = $script:Config.language
 $script:T = $Strings[(Resolve-Lang $script:LangSetting)]
 
 # ---------- данные ----------
@@ -85,10 +111,10 @@ function Get-Limits {
     foreach ($pair in @(@('Five', 'five_hour'), @('Week', 'seven_day'))) {
         $w = $d.rate_limits.($pair[1])
         if ($w) {
-            $used = [double]$w.used_percentage
+            $raw = [double]$w.used_percentage
             $reset = [int64]$w.resets_at
-            if ($reset -lt $now) { $used = 0 }   # окно уже сбросилось
-            $res[$pair[0]] = @{ Used = $used; Left = [math]::Max(0, 100 - $used); Reset = $reset }
+            $used = if ($reset -lt $now) { 0 } else { $raw }   # окно уже сбросилось
+            $res[$pair[0]] = @{ Used = $used; RawUsed = $raw; Left = [math]::Max(0, 100 - $used); Reset = $reset }
         }
     }
     return $res
@@ -111,6 +137,44 @@ function Format-Ago([int64]$ts) {
     if ($s -lt 3600) { return ($T.MinAgo -f [math]::Floor($s / 60)) }
     if ($s -lt 86400) { return ($T.HAgo -f [math]::Floor($s / 3600)) }
     return ($T.DAgo -f [math]::Floor($s / 86400))
+}
+
+# ---------- уведомления ----------
+
+function Send-Notification([string]$title, [string]$body, [string]$kind = 'Info') {
+    $tray.BalloonTipTitle = $title
+    $tray.BalloonTipText = $body
+    $tray.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::$kind
+    $tray.ShowBalloonTip(10000)
+}
+
+# Проверяет одно окно лимита; каждое уведомление — один раз на окно.
+function Test-WindowNotify([string]$key, [hashtable]$w, [bool]$five) {
+    $T = $script:T
+    $notified = $script:Config.notified
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    function Already([string]$k) { $notified.ContainsKey($k) -and [math]::Abs($notified[$k] - $w.Reset) -lt 1800 }
+
+    if ($now -lt $w.Reset) {
+        foreach ($th in @(95, 80)) {
+            if ($w.RawUsed -ge $th) {
+                if (-not (Already "${key}:$th")) {
+                    foreach ($t in @(95, 80)) { if ($t -le $th) { $notified["${key}:$t"] = [double]$w.Reset } }
+                    $used = [math]::Round($w.RawUsed)
+                    $bodyFmt = if ($five) { $T.LowBodyFive } else { $T.LowBodyWeek }
+                    $icon = if ($th -ge 95) { 'Warning' } else { 'Info' }
+                    Send-Notification ($T.LowTitle -f [math]::Max(0, 100 - $used)) ($bodyFmt -f $used, (Format-Countdown $w.Reset)) $icon
+                    Save-Config
+                }
+                break
+            }
+        }
+    } elseif (($now - $w.Reset) -lt 900 -and $w.RawUsed -ge 80 -and -not (Already "${key}:reset")) {
+        $notified["${key}:reset"] = [double]$w.Reset
+        $body = if ($five) { $T.ResetBodyFive } else { $T.ResetBodyWeek }
+        Send-Notification $T.ResetTitle $body
+        Save-Config
+    }
 }
 
 function Get-LevelColor([double]$used) {
@@ -165,7 +229,8 @@ $miWeekR   = $menu.Items.Add(''); $miWeekR.Enabled = $false
 $miUpdated = $menu.Items.Add(''); $miUpdated.Enabled = $false
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $miStartup = $menu.Items.Add('')
-$miLang    = New-Object System.Windows.Forms.ToolStripMenuItem
+$miNotif   = $menu.Items.Add('')
+$miLang   = New-Object System.Windows.Forms.ToolStripMenuItem
 $menu.Items.Add($miLang) | Out-Null
 $miLangSys = $miLang.DropDownItems.Add('')
 $miLangRu  = $miLang.DropDownItems.Add('Русский')
@@ -179,6 +244,8 @@ function Update-StaticTexts {
     $T = $script:T
     $miTitle.Text   = $T.Title
     $miStartup.Text = $T.Startup
+    $miNotif.Text   = $T.Notifications
+    $miNotif.Checked = [bool]$script:Config.notifications
     $miLang.Text    = $T.Language
     $miLangSys.Text = $T.System
     $miQuit.Text    = $T.Quit
@@ -220,15 +287,28 @@ function Update-UI {
     if ($l.Five) { $tip += (' · {0}: {1}%' -f $T.TipFive, [math]::Round($l.Five.Left)) }
     if ($l.Week) { $tip += (' · {0}: {1}%' -f $T.TipWeek, [math]::Round($l.Week.Left)) }
     $tray.Text = $tip.Substring(0, [math]::Min(63, $tip.Length))
+
+    if ($script:Config.notifications) {
+        if ($l.Five) { Test-WindowNotify 'five_hour' $l.Five $true }
+        if ($l.Week) { Test-WindowNotify 'seven_day' $l.Week $false }
+    }
 }
 
 function Set-Language([string]$lang) {
     $script:LangSetting = $lang
     $script:T = $Strings[(Resolve-Lang $lang)]
-    try { Save-LangSetting $lang } catch { }
+    $script:Config.language = $lang
+    Save-Config
     Update-StaticTexts
     Update-UI
 }
+
+$miNotif.Add_Click({
+    $script:Config.notifications = -not $script:Config.notifications
+    Save-Config
+    Update-StaticTexts
+    if ($script:Config.notifications) { Send-Notification $script:T.NotifOnTitle $script:T.NotifOnBody }
+})
 
 $miLangSys.Add_Click({ Set-Language 'system' })
 $miLangRu.Add_Click({ Set-Language 'ru' })
