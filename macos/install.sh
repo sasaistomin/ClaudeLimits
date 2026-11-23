@@ -1,10 +1,10 @@
 #!/bin/bash
 # Установка ClaudeLimits для macOS.
 # Запуск из папки проекта:   ./macos/install.sh
-# Или одной командой:        curl -fsSL https://raw.githubusercontent.com/OWNER/claude-limits/main/macos/install.sh | bash
+# Или одной командой:        curl -fsSL https://raw.githubusercontent.com/sasaistomin/claude-limits/main/macos/install.sh | bash
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/OWNER/claude-limits/main"
+REPO_RAW="https://raw.githubusercontent.com/sasaistomin/claude-limits/main"
 APP="$HOME/Applications/ClaudeLimits.app"
 BIN="$APP/Contents/MacOS/ClaudeLimits"
 

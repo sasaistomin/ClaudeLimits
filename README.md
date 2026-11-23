@@ -42,7 +42,7 @@ Claude Code ──(после каждого ответа)──> statusline-с�
 Откройте **Терминал** и вставьте:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/claude-limits/main/macos/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sasaistomin/claude-limits/main/macos/install.sh | bash
 ```
 
 ### Вариант 2: из скачанного архива
@@ -73,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/OWNER/claude-limits/main/macos/inst
 Откройте **PowerShell** (Пуск → введите «PowerShell») и вставьте:
 
 ```powershell
-irm https://raw.githubusercontent.com/OWNER/claude-limits/main/windows/install.ps1 -OutFile "$env:TEMP\cl-install.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\cl-install.ps1"
+irm https://raw.githubusercontent.com/sasaistomin/claude-limits/main/windows/install.ps1 -OutFile "$env:TEMP\cl-install.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\cl-install.ps1"
 ```
 
 ### Вариант 2: из скачанного архива
