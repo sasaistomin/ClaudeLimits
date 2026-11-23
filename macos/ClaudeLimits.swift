@@ -146,17 +146,90 @@ struct WindowState {
     var remaining: Double { max(0, 100 - used) }
 }
 
+// MARK: - Localization
+
+enum AppLanguage: String, CaseIterable, Identifiable {
+    case system, ru, en
+    var id: String { rawValue }
+
+    /// Название пункта в выборе языка — всегда на своём языке.
+    func label(_ l: L10n) -> String {
+        switch self {
+        case .system: return l.systemLanguage
+        case .ru: return "Русский"
+        case .en: return "English"
+        }
+    }
+
+    var resolvedIsRussian: Bool {
+        switch self {
+        case .ru: return true
+        case .en: return false
+        case .system: return (Locale.preferredLanguages.first ?? "en").hasPrefix("ru")
+        }
+    }
+}
+
+struct L10n {
+    let ru: Bool
+
+    var locale: Locale { Locale(identifier: ru ? "ru_RU" : "en_US") }
+
+    var title: String          { ru ? "Лимиты Claude" : "Claude Limits" }
+    var fiveHour: String       { ru ? "5-часовое окно" : "5-hour window" }
+    var week: String           { ru ? "Неделя" : "Weekly" }
+    var noData: String         { ru ? "нет данных" : "no data" }
+    var noFile: String         { ru ? "Пока нет данных. Отправьте любое сообщение в Claude Code."
+                                    : "No data yet. Send any message in Claude Code." }
+    var badFile: String        { ru ? "Не удалось прочитать ~/.claude/limits.json"
+                                    : "Couldn't read ~/.claude/limits.json" }
+    var launchAtLogin: String  { ru ? "Запускать при входе в систему" : "Launch at login" }
+    var language: String       { ru ? "Язык" : "Language" }
+    var systemLanguage: String { ru ? "Системный" : "System" }
+    var quit: String           { ru ? "Выйти" : "Quit" }
+
+    func left(_ p: Int) -> String { ru ? "осталось \(p)%" : "\(p)% left" }
+
+    func usedReset(_ p: Int, _ reset: String) -> String {
+        ru ? "Использовано \(p)% · сброс \(reset)" : "Used \(p)% · resets \(reset)"
+    }
+
+    func updated(_ date: Date) -> String {
+        let rel = date.formatted(.relative(presentation: .named).locale(locale))
+        return ru ? "Обновлено \(rel)" : "Updated \(rel)"
+    }
+
+    func countdown(to date: Date) -> String {
+        let s = Int(date.timeIntervalSinceNow)
+        if s <= 0 { return ru ? "сброшен" : "done" }
+        let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+        if d > 0 { return ru ? "через \(d) д \(h) ч" : "in \(d)d \(h)h" }
+        if h > 0 { return ru ? "через \(h) ч \(m) мин" : "in \(h)h \(m)m" }
+        return ru ? "через \(m) мин" : "in \(m)m"
+    }
+}
+
+// MARK: - Store
+
+enum LoadError { case noFile, badFile }
+
 @MainActor
 final class LimitsStore: ObservableObject {
     @Published var fiveHour: WindowState?
     @Published var sevenDay: WindowState?
     @Published var updatedAt: Date?
-    @Published var error: String?
+    @Published var error: LoadError?
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var language: AppLanguage {
+        didSet { UserDefaults.standard.set(language.rawValue, forKey: "language") }
+    }
+
+    var l10n: L10n { L10n(ru: language.resolvedIsRussian) }
 
     private var timer: Timer?
 
     init() {
+        language = AppLanguage(rawValue: UserDefaults.standard.string(forKey: "language") ?? "") ?? .system
         reload()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reload() }
@@ -164,10 +237,7 @@ final class LimitsStore: ObservableObject {
     }
 
     func reload() {
-        guard let data = try? Data(contentsOf: limitsURL) else {
-            error = "Пока нет данных. Отправьте любое сообщение в Claude Code."
-            return
-        }
+        guard let data = try? Data(contentsOf: limitsURL) else { error = .noFile; return }
         do {
             let f = try JSONDecoder().decode(LimitsFile.self, from: data)
             error = nil
@@ -175,7 +245,7 @@ final class LimitsStore: ObservableObject {
             fiveHour = Self.state(f.rate_limits.five_hour)
             sevenDay = Self.state(f.rate_limits.seven_day)
         } catch {
-            self.error = "Не удалось прочитать ~/.claude/limits.json"
+            self.error = .badFile
         }
     }
 
@@ -213,20 +283,12 @@ func color(for used: Double) -> Color {
     }
 }
 
-func countdown(to date: Date) -> String {
-    let s = Int(date.timeIntervalSinceNow)
-    if s <= 0 { return "сброшен" }
-    let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
-    if d > 0 { return "через \(d) д \(h) ч" }
-    if h > 0 { return "через \(h) ч \(m) мин" }
-    return "через \(m) мин"
-}
-
 // MARK: - Views
 
 struct WindowRow: View {
     let title: String
     let state: WindowState?
+    let l: L10n
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -234,17 +296,17 @@ struct WindowRow: View {
                 Text(title).font(.headline)
                 Spacer()
                 if let s = state {
-                    Text("осталось \(Int(s.remaining.rounded()))%")
+                    Text(l.left(Int(s.remaining.rounded())))
                         .monospacedDigit()
                         .foregroundStyle(color(for: s.used))
                 } else {
-                    Text("нет данных").foregroundStyle(.secondary)
+                    Text(l.noData).foregroundStyle(.secondary)
                 }
             }
             ProgressView(value: min(1, (state?.used ?? 0) / 100))
                 .tint(color(for: state?.used ?? 0))
             if let s = state {
-                Text("Использовано \(Int(s.used.rounded()))% · сброс \(countdown(to: s.resetsAt))")
+                Text(l.usedReset(Int(s.used.rounded()), l.countdown(to: s.resetsAt)))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -256,36 +318,44 @@ struct PopoverView: View {
     @ObservedObject var store: LimitsStore
 
     var body: some View {
+        let l = store.l10n
         VStack(alignment: .leading, spacing: 14) {
-            Text("Лимиты Claude").font(.title3.bold())
+            Text(l.title).font(.title3.bold())
 
-            if let e = store.error {
-                Text(e).font(.callout).foregroundStyle(.secondary)
-            } else {
-                WindowRow(title: "5-часовое окно", state: store.fiveHour)
-                WindowRow(title: "Неделя", state: store.sevenDay)
+            switch store.error {
+            case .noFile?: Text(l.noFile).font(.callout).foregroundStyle(.secondary)
+            case .badFile?: Text(l.badFile).font(.callout).foregroundStyle(.secondary)
+            case nil:
+                WindowRow(title: l.fiveHour, state: store.fiveHour, l: l)
+                WindowRow(title: l.week, state: store.sevenDay, l: l)
             }
 
             Divider()
 
-            Toggle("Запускать при входе в систему", isOn: Binding(
+            Toggle(l.launchAtLogin, isOn: Binding(
                 get: { store.launchAtLogin },
                 set: { store.setLaunchAtLogin($0) }
             ))
             .toggleStyle(.checkbox)
 
+            Picker(l.language, selection: $store.language) {
+                ForEach(AppLanguage.allCases) { Text($0.label(l)).tag($0) }
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+
             HStack {
                 if let u = store.updatedAt {
-                    Text("Обновлено \(u.formatted(.relative(presentation: .named)))")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text(l.updated(u)).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Выйти") { NSApplication.shared.terminate(nil) }
+                Button(l.quit) { NSApplication.shared.terminate(nil) }
                     .controlSize(.small)
             }
         }
         .padding(16)
         .frame(width: 300)
+        .environment(\.locale, l.locale)
     }
 }
 
