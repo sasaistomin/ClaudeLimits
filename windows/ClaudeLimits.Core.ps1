@@ -2,7 +2,7 @@
 # Подключается из ClaudeLimits.ps1 и из тестов: tests/windows/run-tests.ps1
 # Работает в Windows PowerShell 5.1 и PowerShell 7.
 
-$Strings = @{
+$Strings = @{ 
     ru = @{
         Title = 'Лимиты Claude'; Five = '5 часов'; Week = 'Неделя'
         NoData = 'нет данных'; NoDataLong = 'Пока нет данных.'; SendMsg = 'Отправьте любое сообщение в Claude Code.'
