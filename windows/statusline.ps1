@@ -13,7 +13,8 @@ if ($data.model -and $data.model.display_name) { $model = $data.model.display_na
 $rl = $data.rate_limits
 
 if ($rl) {
-    $dir = Join-Path $env:USERPROFILE '.claude'
+    $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+    $dir = Join-Path $userHome '.claude'
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
     $out = [ordered]@{
         updated_at  = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()

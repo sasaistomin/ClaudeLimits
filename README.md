@@ -180,13 +180,26 @@ windows/
   install.ps1            установка
   uninstall.ps1          удаление
 tests/
+  smoke.sh               smoke-тест: быстрая проверка главного (≈10 секунд)
   run-all.sh             все тесты, доступные на этом компьютере
   macos/                 юнит-тесты (UnitTests.swift) и интеграционные (integration.sh)
+  windows/smoke.ps1      smoke-тест Windows
   windows/run-tests.ps1  тесты Windows-версии (логика, statusline, установка, значок, удаление)
 .github/workflows/tests.yml  автопроверка на macOS, Windows (PowerShell 5.1 и 7) и Linux при каждом push
 ```
 
 ## Тесты
+
+Smoke-тест: за несколько секунд проверяет главное (установка → строка статуса → окно → удаление):
+
+```bash
+bash tests/smoke.sh                  # macOS
+SMOKE_REMOTE=1 bash tests/smoke.sh   # + файлы на GitHub совпадают с локальными
+```
+
+На Windows: `powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\smoke.ps1`
+
+Все тесты:
 
 ```bash
 bash tests/run-all.sh
