@@ -1,6 +1,6 @@
 ﻿# Установка ClaudeLimits для Windows.
-# Одной командой (PowerShell):
-#   irm https://raw.githubusercontent.com/sasaistomin/claude-limits/main/windows/install.ps1 -OutFile "$env:TEMP\cl-install.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\cl-install.ps1"
+# Одной командой (в PowerShell или cmd):
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/sasaistomin/claude-limits/main/windows/install.ps1 -OutFile $env:TEMP\cl-install.ps1; & $env:TEMP\cl-install.ps1"
 # Или из скачанной папки проекта:
 #   powershell -ExecutionPolicy Bypass -File windows\install.ps1
 

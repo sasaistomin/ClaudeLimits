@@ -73,10 +73,10 @@ curl -fsSL https://raw.githubusercontent.com/sasaistomin/claude-limits/main/maco
 
 ### Вариант 1: одной командой
 
-Откройте **PowerShell** (Пуск → введите «PowerShell») и вставьте:
+Откройте **PowerShell** или **командную строку** (Пуск → введите «PowerShell» или «cmd») и вставьте:
 
-```powershell
-irm https://raw.githubusercontent.com/sasaistomin/claude-limits/main/windows/install.ps1 -OutFile "$env:TEMP\cl-install.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\cl-install.ps1"
+```
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/sasaistomin/claude-limits/main/windows/install.ps1 -OutFile $env:TEMP\cl-install.ps1; & $env:TEMP\cl-install.ps1"
 ```
 
 ### Вариант 2: из скачанного архива
