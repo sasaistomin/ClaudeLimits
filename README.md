@@ -1,9 +1,9 @@
 # Claude Limits
 
-Показывает, **сколько лимита Claude осталось**, прямо в меню-баре macOS или в трее Windows.
+Показывает, **сколько лимита Claude осталось**, прямо в меню-баре macOS, в трее Windows или на панели Linux.
 
 ```
-macOS:   ◔ 86%          Windows:   (86)  ← цветной кружок в трее
+macOS:   ◔ 86%          Windows:   (86)  ← цветной кружок в трее          Linux:   ◯ 86%
 ```
 
 По клику открываются подробности:
@@ -98,6 +98,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubus
 
 ---
 
+## Установка на Linux
+
+**Требования:** Ubuntu, Debian, Mint, Fedora, Arch, openSUSE или другой дистрибутив с графической оболочкой (GNOME, KDE, Xfce, Cinnamon, MATE), `python3` и установленный [Claude Code](https://claude.com/claude-code).
+
+### Вариант 1: одной командой
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main/linux/install.sh | bash
+```
+
+### Вариант 2: из скачанного архива
+
+```bash
+bash linux/install.sh
+```
+
+### Что делает установщик
+
+- Если не хватает пакетов для значка (GTK для Python, AppIndicator, `notify-send`), ставит их через `apt`, `dnf`, `pacman` или `zypper`. Для этого может спросить пароль `sudo`.
+- Копирует файлы в `~/.local/share/claude-limits`.
+- Прописывает statusline в `~/.claude/settings.json`. Старый файл сохраняется как `settings.json.bak`.
+- Добавляет автозапуск при входе в систему: `~/.config/autostart/claude-limits.desktop`.
+- Запускает значок на панели: вверху справа в GNOME/Ubuntu, внизу справа в KDE, Xfce и Cinnamon.
+
+> **«Чистый» GNOME** (Fedora, Debian, Arch без доработок) по умолчанию не показывает значки приложений. Включите расширение [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/) (в Fedora: `sudo dnf install gnome-shell-extension-appindicator`, затем выйдите из системы и войдите снова). В Ubuntu оно уже включено.
+
+---
+
 ## Как пользоваться
 
 1. После установки **отправьте любое сообщение в Claude Code**: после первого ответа появятся цифры.
@@ -112,18 +140,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubus
    - «Лимит Claude сброшен», если до сброса окно было израсходовано на 80% и больше.
 
    Каждое уведомление приходит один раз за окно, отдельно для 5-часового и недельного лимита. На macOS при первом запуске система спросит разрешение: нажмите «Разрешить». Если уведомления не приходят, проверьте «Системные настройки → Уведомления → ClaudeLimits» (macOS) или «Параметры → Система → Уведомления» (Windows).
-8. **График.** На macOS он находится в окне по клику на значок, на Windows — в пункте меню «График использования…». Переключатель **«5 часов / Неделя»** выбирает окно. На графике:
+8. **График.** На macOS он находится в окне по клику на значок, на Windows и Linux — в пункте меню «График использования…». Переключатель **«5 часов / Неделя»** выбирает окно. На графике:
    - синяя ступенчатая линия показывает, как рос расход в текущем окне;
    - серый пунктир — прогноз при текущем темпе;
    - красная пунктирная линия — лимит 100%;
    - при наведении мышью видно, сколько было израсходовано в выбранный момент.
 
    Под графиком подпись: «Прогноз: при таком темпе лимит закончится в 16:40» или «…лимита хватит до сброса». История копится с момента установки, поэтому в первые часы график будет почти пустым.
-9. **Выход** — кнопка «Выйти» (macOS) или «Выход» (Windows) в меню.
+9. **Выход** — кнопка «Выйти» (macOS) или «Выход» (Windows, Linux) в меню.
 
 Чтобы запустить приложение снова после выхода:
 - **macOS:** откройте `~/Applications/ClaudeLimits.app` или найдите «ClaudeLimits» через Spotlight.
 - **Windows:** перезапустите установщик или просто перезагрузите компьютер, если включён автозапуск.
+- **Linux:** `python3 ~/.local/share/claude-limits/claude_limits.py &` или войдите в систему заново, если включён автозапуск.
 
 ---
 
@@ -143,6 +172,11 @@ bash macos/uninstall.sh
 powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ClaudeLimits\uninstall.ps1"
 ```
 
+**Linux:**
+```bash
+bash ~/.local/share/claude-limits/uninstall.sh
+```
+
 Удаление убирает приложение, автозапуск и строку `statusLine` из `settings.json`.
 
 ---
@@ -156,6 +190,12 @@ powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ClaudeLimits\uninsta
 
 **У меня уже был свой statusline. Он пропал?**
 Установщик заменяет его, но сохраняет копию в `~/.claude/settings.json.bak`. Вернуть старый statusline можно, удалив Claude Limits.
+
+**Linux: значка не видно.**
+- В «чистом» GNOME включите расширение AppIndicator (см. «Установка на Linux»).
+- Проверьте, что пакеты на месте: `python3 -c "import gi; gi.require_version('AyatanaAppIndicator3','0.1')"`. Если команда выдаёт ошибку, запустите установщик ещё раз.
+- Запустите значок вручную, чтобы увидеть ошибку: `python3 ~/.local/share/claude-limits/claude_limits.py`.
+- Даже без значка строка статуса `[Модель] 5h: …%` в Claude Code работает.
 
 **Это безопасно?**
 Да. Приложение только читает локальный файл и ничего не отправляет в интернет. Весь код открыт и находится в этом репозитории.
@@ -179,13 +219,20 @@ windows/
   statusline.ps1         statusline-команда для Claude Code
   install.ps1            установка
   uninstall.ps1          удаление
+linux/
+  claude_limits_core.py  логика (то же, что Core.swift), только стандартный Python
+  claude_limits.py       значок на панели (GTK3 + AppIndicator), окно с графиком (cairo)
+  statusline.py          statusline-команда для Claude Code
+  install.sh             установка (ставит нужные пакеты сам)
+  uninstall.sh           удаление
 tests/
   smoke.sh               smoke-тест: быстрая проверка главного (≈10 секунд)
   run-all.sh             все тесты, доступные на этом компьютере
   macos/                 юнит-тесты (UnitTests.swift) и интеграционные (integration.sh)
+  linux/                 юнит-тесты (test_core.py) и интеграционные (integration.sh)
   windows/smoke.ps1      smoke-тест Windows
   windows/run-tests.ps1  тесты Windows-версии (логика, statusline, установка, значок, удаление)
-.github/workflows/tests.yml  автопроверка на macOS, Windows (PowerShell 5.1 и 7) и Linux при каждом push
+.github/workflows/tests.yml  автопроверка на macOS, Windows (PowerShell 5.1 и 7), Ubuntu и Fedora при каждом push
 ```
 
 ## Тесты
@@ -193,7 +240,7 @@ tests/
 Smoke-тест: за несколько секунд проверяет главное (установка → строка статуса → окно → удаление):
 
 ```bash
-bash tests/smoke.sh                  # macOS
+bash tests/smoke.sh                  # macOS или Linux
 SMOKE_REMOTE=1 bash tests/smoke.sh   # + файлы на GitHub совпадают с локальными
 ```
 
@@ -206,10 +253,11 @@ bash tests/run-all.sh
 ```
 
 - **macOS:** юнит-тесты логики и интеграционные тесты. Приложение по-настоящему устанавливается во временную папку (ваши настройки не затрагиваются), проверяются statusline, история, повторная установка, установка со скачиванием, запуск, отрисовка окна и удаление.
+- **Linux:** `bash tests/linux/run.sh`. Юнит-тесты логики и настоящая установка во временную папку: statusline, история, повторная установка, установка со скачиванием, битый `settings.json`, самопроверка значка с отрисовкой графика (если есть дисплей) и удаление. Логика и установка проверяются и на macOS.
 - **Windows:** `powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\run-tests.ps1`. Проверяются логика, statusline, установка, команда из `settings.json` через cmd и Git Bash, самопроверка значка в трее с отрисовкой графика и удаление.
-- **GitHub Actions** запускает всё это при каждом push на macOS, Windows (PowerShell 5.1 и 7) и Linux. Результаты на вкладке **Actions** в репозитории.
+- **GitHub Actions** запускает всё это при каждом push на macOS, Windows (PowerShell 5.1 и 7) и Linux; на чистых Ubuntu и Fedora установщик проверяется «с нуля», вместе с установкой пакетов. Результаты на вкладке **Actions** в репозитории.
 
-Формат `~/.claude/limits.json` одинаков на обеих системах:
+Формат `~/.claude/limits.json` одинаков на всех системах:
 
 ```json
 {
