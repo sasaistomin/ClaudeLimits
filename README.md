@@ -169,15 +169,32 @@ Claude Code получает данные после каждого своего
 
 ```
 macos/
-  ClaudeLimits.swift   приложение (SwiftUI MenuBarExtra) + режимы --statusline / --install / --uninstall
-  install.sh           сборка и установка
-  uninstall.sh         удаление
+  Core.swift             логика: statusline, установка, история, прогноз, правила уведомлений, тексты
+  App.swift              интерфейс: меню-бар (SwiftUI), график (Swift Charts), уведомления
+  install.sh             сборка и установка
+  uninstall.sh           удаление
 windows/
-  ClaudeLimits.ps1     значок в трее (PowerShell + WinForms)
-  statusline.ps1       statusline-команда для Claude Code
-  install.ps1          установка
-  uninstall.ps1        удаление
+  ClaudeLimits.Core.ps1  логика (то же, что Core.swift)
+  ClaudeLimits.ps1       значок в трее (WinForms), окно с графиком (GDI+)
+  statusline.ps1         statusline-команда для Claude Code
+  install.ps1            установка
+  uninstall.ps1          удаление
+tests/
+  run-all.sh             все тесты, доступные на этом компьютере
+  macos/                 юнит-тесты (UnitTests.swift) и интеграционные (integration.sh)
+  windows/run-tests.ps1  тесты Windows-версии (логика, statusline, установка, значок, удаление)
+.github/workflows/tests.yml  автопроверка на macOS, Windows (PowerShell 5.1 и 7) и Linux при каждом push
 ```
+
+## Тесты
+
+```bash
+bash tests/run-all.sh
+```
+
+- **macOS:** юнит-тесты логики и интеграционные тесты. Приложение по-настоящему устанавливается во временную папку (ваши настройки не затрагиваются), проверяются statusline, история, повторная установка, установка со скачиванием, запуск, отрисовка окна и удаление.
+- **Windows:** `powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\run-tests.ps1`. Проверяются логика, statusline, установка, команда из `settings.json` через cmd и Git Bash, самопроверка значка в трее с отрисовкой графика и удаление.
+- **GitHub Actions** запускает всё это при каждом push на macOS, Windows (PowerShell 5.1 и 7) и Linux. Результаты на вкладке **Actions** в репозитории.
 
 Формат `~/.claude/limits.json` одинаков на обеих системах:
 

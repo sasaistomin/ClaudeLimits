@@ -3,7 +3,7 @@
 set -euo pipefail
 APP="$HOME/Applications/ClaudeLimits.app"
 
-pkill -x ClaudeLimits 2>/dev/null || true
+[ -z "${CLAUDE_LIMITS_NO_LAUNCH:-}" ] && { pkill -x ClaudeLimits 2>/dev/null || true; }
 if [ -x "$APP/Contents/MacOS/ClaudeLimits" ]; then
   "$APP/Contents/MacOS/ClaudeLimits" --uninstall || true
 fi

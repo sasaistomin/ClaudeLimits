@@ -1,12 +1,17 @@
 #!/bin/bash
 # Установка ClaudeLimits для macOS.
-# Запуск из папки проекта:   ./macos/install.sh
+# Запуск из папки проекта:   bash macos/install.sh
 # Или одной командой:        curl -fsSL https://raw.githubusercontent.com/sasaistomin/claude-limits/main/macos/install.sh | bash
+#
+# Переменные для тестов:
+#   CLAUDE_LIMITS_REPO_RAW   откуда скачивать исходники (по умолчанию GitHub)
+#   CLAUDE_LIMITS_NO_LAUNCH=1  не останавливать и не запускать приложение
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/sasaistomin/claude-limits/main"
+REPO_RAW="${CLAUDE_LIMITS_REPO_RAW:-https://raw.githubusercontent.com/sasaistomin/claude-limits/main}"
 APP="$HOME/Applications/ClaudeLimits.app"
 BIN="$APP/Contents/MacOS/ClaudeLimits"
+SOURCES=(Core.swift App.swift)
 
 echo "==> ClaudeLimits: установка"
 
@@ -18,24 +23,29 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
   exit 1
 fi
 
-# 2. Исходник: из папки проекта или скачать
+# 2. Исходники: из папки проекта или скачать (при запуске через curl | bash)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/ClaudeLimits.swift" ]; then
-  cp "$SCRIPT_DIR/ClaudeLimits.swift" "$WORK/"
-else
-  echo "==> Скачиваю исходник"
-  curl -fsSL "$REPO_RAW/macos/ClaudeLimits.swift" -o "$WORK/ClaudeLimits.swift"
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
+for f in "${SOURCES[@]}"; do
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$f" ]; then
+    cp "$SCRIPT_DIR/$f" "$WORK/"
+  else
+    echo "==> Скачиваю $f"
+    curl -fsSL "$REPO_RAW/macos/$f" -o "$WORK/$f"
+  fi
+done
 
 # 3. Сборка
 echo "==> Собираю (это займёт ~30 секунд)"
-xcrun swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
-  -o "$WORK/ClaudeLimits" "$WORK/ClaudeLimits.swift"
+( cd "$WORK" && xcrun swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+    -o "$WORK/ClaudeLimits" "${SOURCES[@]}" )
 
 # 4. .app-бандл
-pkill -x ClaudeLimits 2>/dev/null || true
+[ -z "${CLAUDE_LIMITS_NO_LAUNCH:-}" ] && { pkill -x ClaudeLimits 2>/dev/null || true; }
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$WORK/ClaudeLimits" "$BIN"
@@ -62,7 +72,11 @@ codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 "$BIN" --install
 
 # 6. Запуск
-open "$APP"
-echo ""
-echo "Готово! Значок появился в меню-баре."
-echo "Отправьте любое сообщение в Claude Code, чтобы появились цифры."
+if [ -z "${CLAUDE_LIMITS_NO_LAUNCH:-}" ]; then
+  open "$APP"
+  echo ""
+  echo "Готово! Значок появился в меню-баре."
+  echo "Отправьте любое сообщение в Claude Code, чтобы появились цифры."
+else
+  echo "Готово (без запуска)."
+fi

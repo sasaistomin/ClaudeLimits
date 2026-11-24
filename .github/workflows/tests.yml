@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macOS — сборка, установка, тесты
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/macos/run.sh
+
+  windows:
+    name: Windows — ${{ matrix.ps }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ps: [powershell, pwsh]   # Windows PowerShell 5.1 (как у пользователей) и PowerShell 7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Тесты, установка, значок в трее, удаление
+        shell: cmd
+        run: ${{ matrix.ps }} -NoProfile -ExecutionPolicy Bypass -File tests\windows\run-tests.ps1
+
+  linux-logic:
+    name: Linux — логика Windows-версии (pwsh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pwsh -NoProfile -File tests/windows/run-tests.ps1
