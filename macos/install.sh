@@ -1,14 +1,14 @@
 #!/bin/bash
 # Установка ClaudeLimits для macOS.
 # Запуск из папки проекта:   bash macos/install.sh
-# Или одной командой:        curl -fsSL https://raw.githubusercontent.com/sasaistomin/claude-limits/main/macos/install.sh | bash
+# Или одной командой:        curl -fsSL https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main/macos/install.sh | bash
 #
 # Переменные для тестов:
 #   CLAUDE_LIMITS_REPO_RAW   откуда скачивать исходники (по умолчанию GitHub)
 #   CLAUDE_LIMITS_NO_LAUNCH=1  не останавливать и не запускать приложение
 set -euo pipefail
 
-REPO_RAW="${CLAUDE_LIMITS_REPO_RAW:-https://raw.githubusercontent.com/sasaistomin/claude-limits/main}"
+REPO_RAW="${CLAUDE_LIMITS_REPO_RAW:-https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main}"
 APP="$HOME/Applications/ClaudeLimits.app"
 BIN="$APP/Contents/MacOS/ClaudeLimits"
 SOURCES=(Core.swift App.swift)

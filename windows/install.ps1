@@ -1,6 +1,6 @@
 ﻿# Установка ClaudeLimits для Windows.
 # Одной командой (в PowerShell или cmd):
-#   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/sasaistomin/claude-limits/main/windows/install.ps1 -OutFile $env:TEMP\cl-install.ps1; & $env:TEMP\cl-install.ps1"
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main/windows/install.ps1 -OutFile $env:TEMP\cl-install.ps1; & $env:TEMP\cl-install.ps1"
 # Или из скачанной папки проекта:
 #   powershell -ExecutionPolicy Bypass -File windows\install.ps1
 #
@@ -10,7 +10,7 @@
 #   CLAUDE_LIMITS_STARTUP_DIR  куда класть ярлык автозапуска (по умолчанию «Автозагрузка»)
 
 $ErrorActionPreference = 'Stop'
-$RepoRaw    = if ($env:CLAUDE_LIMITS_REPO_RAW) { $env:CLAUDE_LIMITS_REPO_RAW } else { 'https://raw.githubusercontent.com/sasaistomin/claude-limits/main' }
+$RepoRaw    = if ($env:CLAUDE_LIMITS_REPO_RAW) { $env:CLAUDE_LIMITS_REPO_RAW } else { 'https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main' }
 $InstallDir = Join-Path $env:LOCALAPPDATA 'ClaudeLimits'
 $Settings   = Join-Path $env:USERPROFILE '.claude\settings.json'
 $StartupDir = if ($env:CLAUDE_LIMITS_STARTUP_DIR) { $env:CLAUDE_LIMITS_STARTUP_DIR } else { [Environment]::GetFolderPath('Startup') }
