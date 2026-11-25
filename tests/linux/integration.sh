@@ -31,7 +31,7 @@ echo '{"model":"opus","statusLine":{"type":"command","command":"~/old.sh"}}' > "
 out=$(bash "$REPO/linux/install.sh" 2>&1); code=$?
 check_eq "$code" 0 "install.sh завершился успешно"
 check_eq "$(cat "$DIR/VERSION")" "$(tr -d '[:space:]' < "$REPO/VERSION")" "версия записана"
-for f in claude_limits_core.py claude_limits_parsers.py claude_limits_monitor.py claude_limits.py statusline.py uninstall.sh; do check "[ -f '$DIR/$f' ]" "установлен $f"; done
+for f in claude_limits_core.py claude_limits_parsers.py claude_limits_monitor.py claude_limits_phone.py claude_limits.py statusline.py uninstall.sh; do check "[ -f '$DIR/$f' ]" "установлен $f"; done
 check_eq "$(json "$SETTINGS" statusLine.command)" "python3 \"$DIR/statusline.py\"" "statusLine прописан"
 check_eq "$(json "$SETTINGS" model)" "opus" "остальные настройки сохранены"
 check_eq "$(json "$SETTINGS.bak" statusLine.command)" "~/old.sh" "резервная копия"
@@ -90,11 +90,35 @@ else
   echo "   (пропущено: нет GTK для Python или дисплея)"
 fi
 
+echo "== Виджет на телефоне (поддельный GitHub)"
+GH="$SB/fake-github"; mkdir -p "$GH"
+python3 "$REPO/tests/fake_github.py" "$GH" & ghpid=$!
+for _ in $(seq 50); do [ -f "$GH/port" ] && break; sleep 0.1; done
+export CLAUDE_LIMITS_GITHUB_API="http://127.0.0.1:$(cat "$GH/port")"
+out=$(CLAUDE_LIMITS_GITHUB_TOKEN=bad python3 "$DIR/claude_limits_phone.py" setup 2>&1); code=$?
+check_eq "$code" 1 "setup с неверным токеном"
+has "$out" "401" "понятная ошибка про токен"
+out=$(CLAUDE_LIMITS_GITHUB_TOKEN=good python3 "$DIR/claude_limits_phone.py" setup 2>&1); code=$?
+check_eq "$code" 0 "setup"
+has "$out" "ID для виджета:  g1" "напечатан ID gist"
+check_eq "$(stat -c %a "$SB/.claude/limits-phone.json" 2>/dev/null || stat -f %Lp "$SB/.claude/limits-phone.json")" "600" "файл с токеном доступен только владельцу"
+check_eq "$(json "$GH/g1.json" public)" "False" "gist секретный"
+payload 61 17 Opus | python3 "$DIR/statusline.py" >/dev/null
+( cd "$DIR" && python3 -c "
+import claude_limits_phone as p, claude_limits_parsers as parsers
+s = p.PhoneSync(); s.offer({'code': parsers.new_parser('code').parse_limits()})
+assert s.tick(background=False) and s.error is None, s.error" ) 2>&1; check_eq "$?" 0 "PhoneSync выгружает данные"
+content=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['files']['claude-limits.json']['content'])" "$GH/g1.json" 2>/dev/null)
+has "$content" '"used": 61' "цифры в gist"
+has "$(python3 "$DIR/claude_limits_phone.py" status)" "g1" "status"
+kill $ghpid 2>/dev/null; wait $ghpid 2>/dev/null
+unset CLAUDE_LIMITS_GITHUB_API
+
 echo "== Удаление"
 bash "$DIR/uninstall.sh" >/dev/null 2>&1; code=$?
 check_eq "$code" 0 "uninstall.sh"
 check "[ ! -e '$DIR' ] && [ ! -e '$AUTOSTART' ]" "программа и автозапуск удалены"
-check "[ ! -e '$LIMITS' ] && [ ! -e '$HIST' ]" "данные удалены"
+check "[ ! -e '$LIMITS' ] && [ ! -e '$HIST' ] && [ ! -e '$SB/.claude/limits-phone.json' ]" "данные и токен для виджета удалены"
 check_eq "$(json "$SETTINGS" statusLine)" "" "statusLine убран"
 check_eq "$(json "$SETTINGS" model)" "opus" "остальные настройки сохранены"
 bash "$REPO/linux/install.sh" >/dev/null 2>&1

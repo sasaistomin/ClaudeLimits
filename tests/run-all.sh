@@ -2,6 +2,7 @@
 # Все тесты, которые можно запустить на этом компьютере.
 #   macOS: юнит + интеграционные тесты macOS-версии.
 #   Linux-версия (логика, установка, statusline) — везде, где есть python3; значок в трее — на Linux с дисплеем.
+#   Виджет Scriptable (логика и отрисовка с поддельным API) — если есть node.
 #   Windows-версия (логика) — если установлен PowerShell (pwsh).
 #   Полная проверка Windows (установка, значок в трее) идёт в GitHub Actions: .github/workflows/tests.yml
 set -uo pipefail
@@ -15,6 +16,15 @@ fi
 
 if command -v python3 >/dev/null 2>&1; then
   bash "$REPO/tests/linux/run.sh" || status=1
+  echo ""
+fi
+
+if command -v node >/dev/null 2>&1; then
+  echo "### Виджет Scriptable (node)"
+  node "$REPO/tests/scriptable/test.js" || status=1
+  echo ""
+else
+  echo "### Виджет Scriptable: пропущено — нет node."
   echo ""
 fi
 

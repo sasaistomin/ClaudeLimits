@@ -22,6 +22,7 @@ if (Test-Path $core) {
 
 Remove-Item -Force (Join-Path $ClaudeDir 'limits.json')
 Remove-Item -Force (Join-Path $ClaudeDir 'limits-history.jsonl')
+Remove-Item -Force (Join-Path $ClaudeDir 'limits-phone.json')
 Set-Location $env:USERPROFILE
 Remove-Item -Recurse -Force $InstallDir
 Write-Host 'ClaudeLimits удалён.'

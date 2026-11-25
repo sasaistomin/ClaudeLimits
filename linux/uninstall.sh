@@ -6,6 +6,6 @@ CORE="$INSTALL_DIR/claude_limits_core.py"
 
 [ -z "${CLAUDE_LIMITS_NO_LAUNCH:-}" ] && pkill -f "claude-limits/claude_limits.py" 2>/dev/null
 [ -f "$CORE" ] && python3 "$CORE" uninstall
-rm -f "$HOME/.claude/limits.json" "$HOME/.claude/limits-history.jsonl"
+rm -f "$HOME/.claude/limits.json" "$HOME/.claude/limits-history.jsonl" "$HOME/.claude/limits-phone.json"
 rm -rf "$INSTALL_DIR" "${XDG_CONFIG_HOME:-$HOME/.config}/claude-limits" "${XDG_CACHE_HOME:-$HOME/.cache}/claude-limits"
 echo "ClaudeLimits удалён."

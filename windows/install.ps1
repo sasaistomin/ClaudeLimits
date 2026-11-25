@@ -15,7 +15,7 @@ $InstallDir = Join-Path $env:LOCALAPPDATA 'ClaudeLimits'
 $Settings   = Join-Path $env:USERPROFILE '.claude\settings.json'
 $StartupDir = if ($env:CLAUDE_LIMITS_STARTUP_DIR) { $env:CLAUDE_LIMITS_STARTUP_DIR } else { [Environment]::GetFolderPath('Startup') }
 $NoLaunch   = [bool]$env:CLAUDE_LIMITS_NO_LAUNCH
-$Files      = @('ClaudeLimits.Core.ps1', 'ClaudeLimits.Parsers.ps1', 'ClaudeLimits.Monitoring.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'uninstall.ps1')
+$Files      = @('ClaudeLimits.Core.ps1', 'ClaudeLimits.Parsers.ps1', 'ClaudeLimits.Monitoring.ps1', 'ClaudeLimits.Phone.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'phone.ps1', 'uninstall.ps1')
 $ConfigFile = Join-Path $InstallDir 'config.json'
 
 Write-Host '==> ClaudeLimits: установка' -ForegroundColor Cyan
@@ -94,6 +94,7 @@ if (-not $NoLaunch) {
     Write-Host ''
     Write-Host 'Готово! Значок появился в трее (справа внизу, возможно под стрелкой ^).' -ForegroundColor Green
     Write-Host 'Отправьте любое сообщение в Claude Code, чтобы появились цифры.'
+    Write-Host "Виджет на iPhone (Scriptable): powershell -ExecutionPolicy Bypass -File `"$InstallDir\phone.ps1`" setup"
 } else {
     Write-Host 'Готово (без запуска).'
 }

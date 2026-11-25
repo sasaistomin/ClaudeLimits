@@ -30,12 +30,14 @@ $ConfigFile = Join-Path (Split-Path -Parent $ScriptPath) 'config.json'
 
 . (Join-Path $PSScriptRoot 'ClaudeLimits.Core.ps1')
 . (Join-Path $PSScriptRoot 'ClaudeLimits.Monitoring.ps1')
+. (Join-Path $PSScriptRoot 'ClaudeLimits.Phone.ps1')
 
 $HistoryFiles = @{
     code    = Join-Path $env:USERPROFILE '.claude\limits-history.jsonl'
     desktop = Join-Path $env:USERPROFILE '.claude\limits-desktop-history.jsonl'
 }
 $script:Config = Read-Config $ConfigFile
+$script:Phone = New-PhoneSync
 $script:LangSetting = $script:Config.language
 $script:T = $Strings[(Resolve-Lang $script:LangSetting)]
 
@@ -518,6 +520,7 @@ $miUpdate.Add_Click({
 
 $miQuit.Add_Click({
     $timer.Stop()
+    Stop-PhoneSync $script:Phone
     $script:Monitor.Dispose()
     $tray.Visible = $false
     $tray.Dispose()
@@ -539,6 +542,7 @@ foreach ($source in $Sources) {
     $script:Monitor.Subscribe($source, {
         param($m)
         if ($m.Source -eq 'desktop') { [void](Add-MetricsHistory $m $HistoryFiles.desktop) }
+        $script:Phone.Pending = $script:Monitor.Latest.Clone()
         Test-SourceNotify $m.Source
         if ($m.Source -eq (Get-ActiveSource)) { Update-UI }
         if ($m.Source -eq (Get-ActiveSource) -and $script:ChartCtl) { Update-Chart }
@@ -553,9 +557,11 @@ $timer.Interval = 1000
 $timer.Add_Tick({
     try { [void]$script:Monitor.Dispatch() } catch { }
     try { Complete-UpdateCheck } catch { }
+    try { Complete-PhoneSync $script:Phone } catch { }
     $script:Tick++
     if ($script:Tick % 5 -ne 0) { return }
     try { Update-UI; foreach ($source in $Sources) { Test-SourceNotify $source } } catch { }
+    try { [void](Step-PhoneSync $script:Phone) } catch { }
     if ($script:ChartCtl) { try { Update-Chart } catch { } }
 })
 $timer.Start()

@@ -15,6 +15,7 @@ macOS:   ◔ 86%          Windows:   (86)  ← цветной кружок в т
 - выбор языка интерфейса: русский, English или как в системе;
 - **уведомления**, когда осталось 20% и 5% лимита и когда лимит сбросился;
 - **график расхода** за 5 часов и за неделю с **прогнозом**, когда закончится лимит при текущем темпе.
+- **виджет на iPhone и iPad** через приложение Scriptable (по желанию, см. [ниже](#виджет-на-iphone-и-ipad-scriptable)).
 
 > Работает с подпиской **Claude Pro / Max / Ultra** и **Claude Code**.
 > Данные берутся из официального поля `rate_limits`, которое Claude Code передаёт в statusline.
@@ -172,6 +173,55 @@ bash linux/install.sh
 
 ---
 
+## Виджет на iPhone и iPad (Scriptable)
+
+Те же цифры можно вывести виджетом на экран «Домой» или на экран блокировки телефона. Виджет работает через бесплатное приложение [Scriptable](https://apps.apple.com/app/scriptable/id1405459188).
+
+```
+значок на компьютере ──(раз в минуту, если цифры изменились)──> секретный GitHub Gist ──> виджет Scriptable на iPhone
+```
+
+Телефон не видит файлы компьютера, поэтому приложение на компьютере выгружает в ваш **секретный gist** на GitHub маленький JSON: проценты, время сброса и время обновления. Виджет читает этот gist по ID. Сервер не нужен, данные остаются в вашем аккаунте GitHub.
+
+### 1. Токен GitHub
+
+Откройте [github.com/settings/tokens/new?scopes=gist](https://github.com/settings/tokens/new?scopes=gist&description=Claude%20Limits). Нужна только галочка **gist**. Срок действия выберите любой, нажмите **Generate token** и скопируйте токен (`ghp_…`).
+
+### 2. Настройка на компьютере
+
+| Система | Команда |
+|---|---|
+| macOS | `~/Applications/ClaudeLimits.app/Contents/MacOS/ClaudeLimits --phone-setup` |
+| Windows | `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ClaudeLimits\phone.ps1" setup` |
+| Linux | `python3 ~/.local/share/claude-limits/claude_limits_phone.py setup` |
+
+Команда спросит токен (ввод скрыт), создаст секретный gist и напечатает **ID для виджета**. Токен хранится в `~/.claude/limits-phone.json` с правами только для владельца. Перезапускать значок не нужно: он подхватит настройку сам и выгрузит цифры в течение минуты после следующего ответа Claude.
+
+Проверить настройку: та же команда с `--phone-status` / `status`. Выключить: `--phone-disable` / `disable` (сам gist удаляется вручную на [gist.github.com](https://gist.github.com/)).
+
+### 3. Виджет на телефоне
+
+1. Установите [Scriptable](https://apps.apple.com/app/scriptable/id1405459188) и откройте его.
+2. Нажмите **+**, вставьте целиком содержимое файла [`scriptable/ClaudeLimits.js`](scriptable/ClaudeLimits.js) и назовите скрипт «Claude Limits».
+3. На экране «Домой» долго нажмите на пустое место, затем **+** → **Scriptable**. Выберите размер и добавьте виджет.
+4. Нажмите на виджет: **Script** → «Claude Limits», **Parameter** → ID из шага 2.
+
+Три варианта (размер выбирается при добавлении виджета):
+
+| Вариант | Размер в iOS | Что показывает |
+|---|---|---|
+| **2×4** (широкий) | средний | Claude Code и Claude Desktop рядом: кольцо остатка 5-часового окна, время до сброса, неделя полоской, «обновлено N мин назад» |
+| **2×2** (квадрат) | маленький | один источник: крупное кольцо остатка 5 часов, время до сброса, неделя полоской |
+| **экран блокировки** (iOS 16+) | круглый / прямоугольный / строка | кольцо с процентом; две полоски «5 ч» и «Нед.» со сбросом; строка над часами `✳︎ 21% · 2 ч 10 м · Нед. 87%` |
+
+Цвет кольца и полосок: 🟢 израсходовано меньше 70% · 🟡 70–90% · 🔴 больше 90%. Квадрат и экран блокировки показывают источник, который обновлялся последним. Чтобы закрепить источник, допишите его в Parameter через пробел: `<ID> code` или `<ID> desktop` (в широком виджете тогда останется одна колонка). Большой виджет iOS повторяет широкий.
+
+> iOS сама решает, когда обновлять виджет, обычно раз в 5–15 минут. Цифры свежие, пока на компьютере запущен значок Claude Limits и вы пишете Claude. Подпись «обновлено N мин назад» становится жёлтой, если данным больше часа. После времени сброса окно считается обнулённым, как и на компьютере. Без связи виджет показывает последние полученные данные.
+>
+> Gist секретный: его нет в поиске и в вашем профиле, но открыть его может любой, у кого есть ID. Там только проценты и время, без токенов и текстов переписки.
+
+---
+
 ## Удаление
 
 **macOS:**
@@ -193,7 +243,7 @@ powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ClaudeLimits\uninsta
 bash ~/.local/share/claude-limits/uninstall.sh
 ```
 
-Удаление убирает приложение, автозапуск и строку `statusLine` из `settings.json`.
+Удаление убирает приложение, автозапуск, строку `statusLine` из `settings.json` и токен для виджета (`limits-phone.json`). Gist на GitHub остаётся, его можно удалить на [gist.github.com](https://gist.github.com/).
 
 ---
 
@@ -214,7 +264,7 @@ bash ~/.local/share/claude-limits/uninstall.sh
 - Даже без значка строка статуса `[Модель] 5h: …%` в Claude Code работает.
 
 **Это безопасно?**
-Да. Приложение только читает локальный файл и ничего не отправляет в интернет. Весь код открыт и находится в этом репозитории.
+Да. Приложение только читает локальные файлы. В интернет оно ничего не отправляет, если вы сами не включили виджет для телефона: тогда проценты и время сброса уходят в ваш секретный gist на GitHub. Весь код открыт и находится в этом репозитории.
 
 **Цифры отличаются от claude.ai.**
 Claude Code получает данные после каждого своего ответа. Если вы тратили лимит в браузере, цифры обновятся при следующем ответе Claude Code.
@@ -228,6 +278,7 @@ macos/
   Core.swift             логика: statusline, установка, история, прогноз, правила уведомлений, тексты
   Parsers.swift          парсеры LimitParser: ClaudeCodeParser (limits.json), ClaudeDesktopParser (LevelDB)
   Monitoring.swift       LimitMonitoringService: фоновый опрос, debounce, доставка на главный поток
+  Phone.swift            выгрузка для виджета на телефоне (GitHub Gist), --phone-setup
   App.swift              интерфейс: меню-бар (SwiftUI), вкладки Code / Desktop, график (Swift Charts), уведомления
   install.sh             сборка и установка
   uninstall.sh           удаление
@@ -235,6 +286,8 @@ windows/
   ClaudeLimits.Core.ps1        логика (то же, что Core.swift): тексты, настройки, карточки, уведомления, график
   ClaudeLimits.Parsers.ps1     парсеры LimitParser: ClaudeCodeParser (limits.json), ClaudeDesktopParser (LevelDB)
   ClaudeLimits.Monitoring.ps1  LimitMonitoringService: фоновый опрос в runspace, FileSystemWatcher + debounce
+  ClaudeLimits.Phone.ps1       выгрузка для виджета на телефоне (GitHub Gist)
+  phone.ps1                    настройка виджета: setup | status | disable
   ClaudeLimits.ps1             значок в трее (WinForms), вкладки Claude Code / Claude Desktop, окно с графиком (GDI+)
   statusline.ps1         statusline-команда для Claude Code
   install.ps1            установка
@@ -243,15 +296,20 @@ linux/
   claude_limits_core.py     логика (то же, что Core.swift), только стандартный Python
   claude_limits_parsers.py  парсеры LimitParser: ClaudeCodeParser, ClaudeDesktopParser (LevelDB)
   claude_limits_monitor.py  LimitMonitoringService: фоновые потоки, debounce
+  claude_limits_phone.py    выгрузка для виджета на телефоне (GitHub Gist): setup | status | disable
   claude_limits.py          значок на панели (GTK3 + AppIndicator), вкладки Code / Desktop, окно с графиком (cairo)
   statusline.py          statusline-команда для Claude Code
   install.sh             установка (ставит нужные пакеты сам)
   uninstall.sh           удаление
+scriptable/
+  ClaudeLimits.js        виджет для iPhone/iPad (Scriptable): читает gist, рисует 5 ч и неделю
 tests/
   smoke.sh               smoke-тест: быстрая проверка главного (≈10 секунд)
   run-all.sh             все тесты, доступные на этом компьютере
   macos/                 юнит-тесты (UnitTests.swift) и интеграционные (integration.sh)
-  linux/                 юнит-тесты (test_core.py, test_sources.py) и интеграционные (integration.sh)
+  linux/                 юнит-тесты (test_core.py, test_sources.py, test_phone.py) и интеграционные (integration.sh)
+  scriptable/test.js     тесты виджета в node: логика и отрисовка с поддельным API Scriptable
+  fake_github.py         поддельный GitHub Gist API для тестов выгрузки
   windows/smoke.ps1      smoke-тест Windows
   windows/run-tests.ps1  тесты Windows-версии (логика, парсеры Code/Desktop, фоновый опрос, statusline, установка, значок, удаление)
 .github/workflows/tests.yml  автопроверка на macOS, Windows (PowerShell 5.1 и 7), Ubuntu и Fedora при каждом push

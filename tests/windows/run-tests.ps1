@@ -684,6 +684,119 @@ Test 'statusline.ps1: запись данных, история, устойчи�
     Remove-Item -Recurse -Force $d
 }
 
+# ============================================================ 3б. Виджет на телефоне
+Write-Host '== Виджет на телефоне (ClaudeLimits.Phone.ps1, phone.ps1)'
+. (Join-Path $WinDir 'ClaudeLimits.Phone.ps1')
+
+function New-PhoneMetrics([double]$Five = 42.5, [int64]$Now = 1800000000) {
+    $c = [LimitMetrics]::new('code'); $c.Status = 'Ok'; $c.Updated = $Now - 100
+    $c.Windows = @([LimitParser]::NewWindow('five_hour', $Five, $Now + 10000, $false, $Now), [LimitParser]::NewWindow('seven_day', 13, $Now + 300000, $false, $Now))
+    $d = [LimitMetrics]::new('desktop'); $d.Status = 'Ok'; $d.Updated = $Now - 10000
+    $d.Windows = @([LimitParser]::NewWindow('five_hour', 80, $Now + 5000, $true, $Now), [LimitParser]::NewWindow('seven_day', 20, $Now + 300000, $false, $Now))
+    return @{ code = $c; desktop = $d }
+}
+
+function Start-FakeGitHub {
+    $names = if ($OnWindows) { @('python', 'python3') } else { @('python3', 'python') }
+    $py = $names | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+    if (-not $py) { return $null }
+    $dir = New-TempDir
+    $spArgs = @{ FilePath = (Get-Command $py).Source; ArgumentList = @("`"$(Join-Path $Repo 'tests/fake_github.py')`"", "`"$dir`""); PassThru = $true }
+    if ($OnWindows) { $spArgs.WindowStyle = 'Hidden' }
+    $proc = Start-Process @spArgs
+    $portFile = Join-Path $dir 'port'
+    for ($i = 0; $i -lt 100 -and -not (Test-Path $portFile); $i++) { Start-Sleep -Milliseconds 100 }
+    if (-not (Test-Path $portFile)) { Stop-Process -Id $proc.Id -Force; return $null }
+    return @{ Proc = $proc; Dir = $dir; Api = "http://127.0.0.1:$([IO.File]::ReadAllText($portFile).Trim())" }
+}
+
+Test 'Phone: снимок совпадает с форматом виджета (tests/scriptable/payload.json)' {
+    $fixture = [IO.File]::ReadAllText((Join-Path $Repo 'tests/scriptable/payload.json')) | ConvertFrom-Json
+    $p = Get-PhonePayload (New-PhoneMetrics) 1800000000
+    Eq ($p | ConvertTo-Json -Depth 6 -Compress) ($fixture | ConvertTo-Json -Depth 6 -Compress) 'снимок:'
+    $m = New-PhoneMetrics
+    $m.desktop = [LimitMetrics]::new('desktop'); $m.desktop.Status = 'NotFound'
+    $m.code.Windows[0] = [LimitParser]::NewWindow('five_hour', 90, 1799999999, $false, 1800000000)
+    $p = Get-PhonePayload $m 1800000000
+    Eq (@($p.sources.Keys) -join ',') 'code' 'источник без данных пропущен:'
+    Eq $p.sources.code.windows[0].used 90 'процент как есть:'
+    Eq (Get-PhonePayloadKey (Get-PhonePayload (New-PhoneMetrics) 1)) (Get-PhonePayloadKey (Get-PhonePayload (New-PhoneMetrics) 99)) 'ключ без времени отправки:'
+    Eq (Get-PhonePayload @{} 1).sources.Count 0 'нет данных:'
+}
+
+Test 'Phone: когда отправлять' {
+    $n = 1800000000
+    Ok (Test-PhoneShouldSend 'a' $null 0 0 $n) 'первый раз'
+    Ok (-not (Test-PhoneShouldSend 'a' 'a' 0 0 $n)) 'без изменений'
+    Ok (-not (Test-PhoneShouldSend 'b' 'a' ($n - 59) 0 $n)) 'чаще раза в минуту'
+    Ok (Test-PhoneShouldSend 'b' 'a' ($n - 60) 0 $n) 'через минуту'
+    Ok (-not (Test-PhoneShouldSend 'b' 'a' 0 ($n - 299) $n)) 'после ошибки ждём'
+    Ok (Test-PhoneShouldSend 'b' 'a' 0 ($n - 300) $n) 'через 5 минут после ошибки'
+}
+
+Test 'Phone: настройки и тело запроса' {
+    $d = New-TempDir
+    $cfg = Join-Path $d '.claude/limits-phone.json'
+    Ok ($null -eq (Read-PhoneConfig $cfg)) 'нет настроек'
+    Save-PhoneConfig 'tok' 'gid' $cfg
+    $c = Read-PhoneConfig $cfg
+    Ok ($c.token -eq 'tok' -and $c.gist_id -eq 'gid') 'настройки сохранены'
+    [IO.File]::WriteAllText($cfg, '{"token":""}')
+    Ok ($null -eq (Read-PhoneConfig $cfg)) 'пустой токен — не настроено'
+    $b = Get-PhoneGistBody (Get-PhonePayload (New-PhoneMetrics) 5) -Create | ConvertFrom-Json
+    Eq $b.public $false 'gist секретный:'
+    $content = $b.files.'claude-limits.json'.content | ConvertFrom-Json
+    Eq $content.sources.code.windows[0].used 42.5 'в gist уходит снимок:'
+    Eq $content.sources.desktop.windows[0].rolling $true 'скользящее окно Desktop:'
+    Eq (Get-PhoneErrorText 401).Contains('401') $true 'текст ошибки 401:'
+    Remove-Item -Recurse -Force $d
+}
+
+Test 'Phone: фоновая выгрузка и phone.ps1 с поддельным GitHub' {
+    $gh = Start-FakeGitHub
+    if (-not $gh) { Write-Host '   (пропущено: нет python для поддельного GitHub)'; return }
+    $d = New-TempDir
+    $saved = @{ USERPROFILE = $env:USERPROFILE; API = $env:CLAUDE_LIMITS_GITHUB_API; TOKEN = $env:CLAUDE_LIMITS_GITHUB_TOKEN }
+    try {
+        $env:USERPROFILE = $d
+        $env:CLAUDE_LIMITS_GITHUB_API = $gh.Api
+        $psArgs = @('-NoProfile')
+        if ($OnWindows) { $psArgs += @('-ExecutionPolicy', 'Bypass') }
+        $psArgs += @('-File', (Join-Path $WinDir 'phone.ps1'))
+        $env:CLAUDE_LIMITS_GITHUB_TOKEN = 'bad'
+        $out = (& $PsExe @psArgs setup) -join "`n"
+        Eq $LASTEXITCODE 1 "неверный токен ($out):"
+        Ok ($out -like '*401*') "понятная ошибка: $out"
+        $env:CLAUDE_LIMITS_GITHUB_TOKEN = 'good'
+        $out = (& $PsExe @psArgs setup) -join "`n"
+        Eq $LASTEXITCODE 0 "setup ($out):"
+        Ok ($out -like '*ID для виджета:  g1*') "напечатан ID: $out"
+        Eq (([IO.File]::ReadAllText((Join-Path $gh.Dir 'g1.json')) | ConvertFrom-Json).public) $false 'gist секретный:'
+        $out = (& $PsExe @psArgs setup) -join "`n"
+        Ok (@(Get-ChildItem $gh.Dir -Filter 'g*.json').Count -eq 1) 'повторная настройка использует тот же gist'
+        Ok (((& $PsExe @psArgs status) -join ' ') -like '*g1*') 'status'
+
+        $sync = New-PhoneSync
+        Ok (-not (Step-PhoneSync $sync)) 'нет снимка — нечего слать'
+        $sync.Pending = New-PhoneMetrics 61
+        Ok (Step-PhoneSync $sync) 'выгрузка началась'
+        for ($i = 0; $i -lt 200 -and -not $sync.Job.Handle.IsCompleted; $i++) { Start-Sleep -Milliseconds 50 }
+        Complete-PhoneSync $sync
+        Ok ($null -eq $sync.LastError) "без ошибок ($($sync.LastError))"
+        $content = (([IO.File]::ReadAllText((Join-Path $gh.Dir 'g1.json')) | ConvertFrom-Json).files.'claude-limits.json'.content | ConvertFrom-Json)
+        Eq $content.sources.code.windows[0].used 61 'цифры в gist:'
+        Ok (-not (Step-PhoneSync $sync)) 'те же цифры — не отправляем'
+
+        $out = (& $PsExe @psArgs disable) -join ' '
+        Ok (-not (Test-Path (Join-Path $d '.claude/limits-phone.json'))) "disable удаляет токен: $out"
+        Ok (-not (Step-PhoneSync $sync) -and -not $sync.Config) 'настройки удалены — выгрузка выключена'
+    } finally {
+        $env:USERPROFILE = $saved.USERPROFILE; $env:CLAUDE_LIMITS_GITHUB_API = $saved.API; $env:CLAUDE_LIMITS_GITHUB_TOKEN = $saved.TOKEN
+        Stop-Process -Id $gh.Proc.Id -Force -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $d, $gh.Dir -ErrorAction SilentlyContinue
+    }
+}
+
 # ============================================================ 4. Только Windows
 if ($OnWindows) {
     Write-Host '== Установка / значок / удаление (Windows)'
@@ -703,7 +816,7 @@ if ($OnWindows) {
             Write-Utf8 $settings '{"model":"opus","statusLine":{"type":"command","command":"~/old.sh"}}'
             $out = & $PsExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $WinDir 'install.ps1') 2>&1
             Eq $LASTEXITCODE 0 "код выхода ($($out -join ' | ')):"
-            foreach ($f in @('ClaudeLimits.Core.ps1', 'ClaudeLimits.Parsers.ps1', 'ClaudeLimits.Monitoring.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'uninstall.ps1')) {
+            foreach ($f in @('ClaudeLimits.Core.ps1', 'ClaudeLimits.Parsers.ps1', 'ClaudeLimits.Monitoring.ps1', 'ClaudeLimits.Phone.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'phone.ps1', 'uninstall.ps1')) {
                 Ok (Test-Path (Join-Path $inst $f)) "установлен $f"
             }
             $cfg = Read-Config (Join-Path $inst 'config.json')

@@ -5,10 +5,12 @@
 //   ClaudeLimits --statusline            — statusline-команда для Claude Code (stdin -> ~/.claude/limits.json)
 //   ClaudeLimits --install               — прописать statusline в ~/.claude/settings.json
 //   ClaudeLimits --uninstall             — убрать statusline из ~/.claude/settings.json
+//   ClaudeLimits --phone-setup | --phone-disable | --phone-status — виджет на iPhone (Scriptable), см. Phone.swift
 //   ClaudeLimits --check-update          — сравнить версию с VERSION на GitHub (код выхода 10 — есть обновление)
 //   ClaudeLimits --snapshot out.png [week] [dark] [desktop] — сохранить окно в PNG (отладка)
 //
-// Логика — в Core.swift, источники — в Parsers.swift, фоновый опрос — в Monitoring.swift; здесь только интерфейс.
+// Логика — в Core.swift, источники — в Parsers.swift, фоновый опрос — в Monitoring.swift,
+// выгрузка для виджета на телефоне — в Phone.swift; здесь только интерфейс.
 // Вкладки «Claude Code» / «Claude Desktop»; выбранная вкладка и папка Desktop хранятся в UserDefaults.
 
 import SwiftUI
@@ -27,6 +29,9 @@ enum Main {
         if args.contains("--statusline") { StatusLine.run(); return }
         if args.contains("--install") { exit(Installer.install() ? 0 : 1) }
         if args.contains("--uninstall") { exit(Installer.uninstall() ? 0 : 1) }
+        if args.contains("--phone-setup") { exit(Phone.setup() ? 0 : 1) }
+        if args.contains("--phone-disable") { exit(Phone.disable() ? 0 : 1) }
+        if args.contains("--phone-status") { exit(Phone.status() ? 0 : 1) }
         if args.contains("--check-update") {
             guard let data = try? Data(contentsOf: Updater.versionURL),
                   let remote = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
@@ -106,6 +111,7 @@ final class LimitsStore: ObservableObject {
     let hover = HoverModel()
     let updates = UpdateModel()
     let monitor = LimitMonitoringService()
+    let phone = PhoneSync()
     private var historyModDates: [URL: Date] = [:]
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var language: AppLanguage {
@@ -148,6 +154,7 @@ final class LimitsStore: ObservableObject {
             monitor.subscribe(source) { [weak self] m in
                 guard let self else { return }
                 self.metrics[m.source] = m
+                self.phone.offer(self.metrics)
                 if m.source == .desktop {
                     History.append(m, to: desktopHistoryURL)
                     self.reloadHistory()
@@ -168,6 +175,7 @@ final class LimitsStore: ObservableObject {
         reloadHistory()
         objectWillChange.send()
         if notificationsOn { metrics.values.forEach { Notifier.check($0, l: l10n) } }
+        phone.tick()
     }
 
     private func reloadHistory() {

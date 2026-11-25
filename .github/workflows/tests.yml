@@ -45,6 +45,16 @@ jobs:
         if: always()
         run: bash tests/ci-report.sh pwsh -NoProfile -File tests/windows/run-tests.ps1
 
+  scriptable:
+    name: Виджет Scriptable (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Логика и отрисовка виджета
+        run: bash tests/ci-report.sh node tests/scriptable/test.js
+
   linux:
     name: Linux (Ubuntu) — установка, значок в трее, тесты
     runs-on: ubuntu-latest

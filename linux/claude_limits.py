@@ -15,6 +15,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claude_limits_core as core  # noqa: E402
 from claude_limits_monitor import LimitMonitoringService  # noqa: E402
+from claude_limits_phone import PhoneSync  # noqa: E402
 
 import gi  # noqa: E402
 gi.require_version('Gtk', '3.0')
@@ -239,6 +240,7 @@ class App:
             self.status_icon.connect('activate', self.popup)
             self.status_icon.connect('popup-menu', self.popup)
         self.monitor = LimitMonitoringService()
+        self.phone = PhoneSync()
         for source in core.SOURCES:
             self.monitor.subscribe(source, self.on_metrics)
         self.monitor.watch('code')
@@ -362,6 +364,7 @@ class App:
     def on_metrics(self, m):
         if m.source == 'desktop':
             core.append_metrics_history(m)
+        self.phone.offer(dict(self.monitor.latest))
         self.check_notifications(m.source)
         if m.source == self.source:
             self.update()
@@ -374,6 +377,7 @@ class App:
                 self.update()
                 for source in core.SOURCES:
                     self.check_notifications(source)
+                self.phone.tick()
         except Exception as e:  # не даём таймеру умереть
             print('update error:', e, file=sys.stderr)
         return True

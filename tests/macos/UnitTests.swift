@@ -458,6 +458,86 @@ enum UnitTests {
             eq(svc.activeWorkers, 0, "все очереди остановлены:")
         }
 
+        // MARK: Виджет на телефоне (Phone.swift)
+        func phoneMetrics(code five: Double = 42.5) -> [LimitSource: LimitMetrics] {
+            var c = LimitMetrics(source: .code, status: .ok, updated: now - 100)
+            c.windows = [LimitWindow(id: "five_hour", raw: five, resetsAt: now + 10000, rolling: false, now: now),
+                         LimitWindow(id: "seven_day", raw: 13, resetsAt: now + 300000, rolling: false, now: now)]
+            var d = LimitMetrics(source: .desktop, status: .ok, updated: now - 10000)
+            d.windows = [LimitWindow(id: "five_hour", raw: 80, resetsAt: now + 5000, rolling: true, now: now),
+                         LimitWindow(id: "seven_day", raw: 20, resetsAt: now + 300000, rolling: false, now: now)]
+            return [.code: c, .desktop: d]
+        }
+        func canonical(_ o: Any) -> String {
+            String(data: try! JSONSerialization.data(withJSONObject: o, options: [.sortedKeys]), encoding: .utf8)!
+        }
+
+        test("Phone: снимок совпадает с форматом виджета (tests/scriptable/payload.json)") {
+            let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .appendingPathComponent("../scriptable/payload.json")
+            let expected = try! JSONSerialization.jsonObject(with: Data(contentsOf: fixture))
+            eq(canonical(Phone.payload(phoneMetrics(), now: now)), canonical(expected))
+            var m = phoneMetrics()
+            m[.desktop] = LimitMetrics(source: .desktop, status: .notFound)
+            m[.code]!.windows[0] = LimitWindow(id: "five_hour", raw: 90, resetsAt: now - 1, rolling: false, now: now)
+            let p = Phone.payload(m, now: now)
+            let sources = p["sources"] as! [String: Any]
+            eq(Array(sources.keys), ["code"], "источник без данных пропущен:")
+            let w = ((sources["code"] as! [String: Any])["windows"] as! [[String: Any]])[0]
+            eq(w["used"] as? Double, 90, "процент как есть (виджет сам обнуляет):")
+            eq(Phone.key(Phone.payload(phoneMetrics(), now: now)), Phone.key(Phone.payload(phoneMetrics(), now: now + 99)), "ключ без времени отправки:")
+        }
+
+        test("Phone: когда отправлять") {
+            check(Phone.shouldSend(key: "a", lastKey: nil, lastSent: 0, failedAt: 0, now: now), "первый раз")
+            check(!Phone.shouldSend(key: "a", lastKey: "a", lastSent: 0, failedAt: 0, now: now), "без изменений")
+            check(!Phone.shouldSend(key: "b", lastKey: "a", lastSent: now - 59, failedAt: 0, now: now), "чаще раза в минуту")
+            check(Phone.shouldSend(key: "b", lastKey: "a", lastSent: now - 60, failedAt: 0, now: now), "через минуту")
+            check(!Phone.shouldSend(key: "b", lastKey: "a", lastSent: 0, failedAt: now - 299, now: now), "после ошибки ждём")
+            check(Phone.shouldSend(key: "b", lastKey: "a", lastSent: 0, failedAt: now - 300, now: now), "через 5 минут после ошибки")
+        }
+
+        test("Phone: настройки, запрос к GitHub, фоновая выгрузка") {
+            let url = URL(fileURLWithPath: NSTemporaryDirectory() + "cl-phone-" + UUID().uuidString + "/limits-phone.json")
+            check(PhoneConfig.read(url) == nil, "нет настроек")
+            try! PhoneConfig(token: "tok", gistID: "gid").save(url)
+            eq(PhoneConfig.read(url), PhoneConfig(token: "tok", gistID: "gid"))
+            let perms = (try? FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int) ?? 0
+            eq(perms, 0o600, "права 600:")
+
+            let req = Phone.updateRequest(PhoneConfig(token: "tok", gistID: "gid"), Phone.payload(phoneMetrics(), now: now))
+            eq(req.httpMethod, "PATCH")
+            eq(req.url?.absoluteString, "https://api.github.com/gists/gid")
+            eq(req.value(forHTTPHeaderField: "Authorization"), "Bearer tok")
+            let body = try! JSONSerialization.jsonObject(with: req.httpBody!) as! [String: Any]
+            let content = ((body["files"] as! [String: Any])["claude-limits.json"] as! [String: Any])["content"] as! String
+            let sent = try! JSONSerialization.jsonObject(with: Data(content.utf8)) as! [String: Any]
+            eq(canonical(sent["sources"]!), canonical(Phone.payload(phoneMetrics(), now: now)["sources"]!), "в gist уходит снимок:")
+            let create = try! JSONSerialization.jsonObject(with: Phone.createRequest(token: "t", [:]).httpBody!) as! [String: Any]
+            eq(create["public"] as? Bool, false, "gist секретный:")
+
+            var calls = 0
+            var status = 200
+            let sync = PhoneSync(url: url)
+            sync.send = { _, done in calls += 1; done(status) }
+            func settle() { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+            check(!sync.tick(now: now), "нет снимка — нечего слать")
+            sync.offer(phoneMetrics())
+            check(sync.tick(now: now), "первая выгрузка"); settle()
+            check(!sync.tick(now: now + 120), "те же цифры"); settle()
+            sync.offer(phoneMetrics(code: 50))
+            check(!sync.tick(now: now + 30), "не чаще раза в минуту")
+            status = 500
+            check(sync.tick(now: now + 130), "новые цифры"); settle()
+            eq(sync.lastError, 500, "ошибка запомнена:")
+            check(!sync.tick(now: now + 200), "после ошибки ждём")
+            status = 200
+            check(sync.tick(now: now + 500), "повтор после паузы"); settle()
+            eq(calls, 3)
+            try? FileManager.default.removeItem(at: url)
+            check(!sync.tick(now: now + 1000) && !sync.enabled, "настройки удалены — выгрузка выключена")
+        }
+
         // MARK: Итог
         print("")
         if failed.isEmpty {

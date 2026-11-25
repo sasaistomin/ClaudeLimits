@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_RAW="${CLAUDE_LIMITS_REPO_RAW:-https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main}"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claude-limits"
-FILES="claude_limits_core.py claude_limits_parsers.py claude_limits_monitor.py claude_limits.py statusline.py uninstall.sh"
+FILES="claude_limits_core.py claude_limits_parsers.py claude_limits_monitor.py claude_limits_phone.py claude_limits.py statusline.py uninstall.sh"
 
 echo "==> ClaudeLimits: установка"
 
@@ -88,6 +88,7 @@ if [ -z "${CLAUDE_LIMITS_NO_LAUNCH:-}" ] && [ "$TRAY" = 1 ]; then
   echo ""
   echo "Готово! Значок появился в трее (вверху справа или внизу, в зависимости от оболочки)."
   echo "Отправьте любое сообщение в Claude Code, чтобы появились цифры."
+  echo "Виджет на iPhone (Scriptable): python3 \"$INSTALL_DIR/claude_limits_phone.py\" setup"
   case "${XDG_CURRENT_DESKTOP:-}" in
     *GNOME*) echo "В «чистом» GNOME (не Ubuntu) нужно расширение AppIndicator: https://extensions.gnome.org/extension/615/";;
   esac

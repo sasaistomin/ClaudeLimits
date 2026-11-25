@@ -102,10 +102,10 @@ fi
 
 if [ -n "${SMOKE_REMOTE:-}" ]; then
   echo ""; echo "### Smoke: файлы на GitHub (то, что скачивают пользователи)"
-  for f in macos/install.sh macos/Core.swift macos/Parsers.swift macos/Monitoring.swift macos/App.swift \
-           linux/install.sh linux/claude_limits_core.py linux/claude_limits_parsers.py linux/claude_limits_monitor.py \
+  for f in macos/install.sh macos/Core.swift macos/Parsers.swift macos/Monitoring.swift macos/Phone.swift macos/App.swift \
+           linux/install.sh linux/claude_limits_core.py linux/claude_limits_parsers.py linux/claude_limits_monitor.py linux/claude_limits_phone.py \
            linux/claude_limits.py linux/statusline.py linux/uninstall.sh windows/install.ps1 windows/ClaudeLimits.Core.ps1 \
-           windows/ClaudeLimits.Parsers.ps1 windows/ClaudeLimits.Monitoring.ps1 \
+           windows/ClaudeLimits.Parsers.ps1 windows/ClaudeLimits.Monitoring.ps1 windows/ClaudeLimits.Phone.ps1 windows/phone.ps1 scriptable/ClaudeLimits.js \
            windows/ClaudeLimits.ps1 windows/statusline.ps1 windows/uninstall.ps1; do
     step "$f"
     code=$(curl -s -o "$(mktemp)" -w '%{http_code}' "$RAW/$f")

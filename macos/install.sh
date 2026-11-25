@@ -11,7 +11,7 @@ set -euo pipefail
 REPO_RAW="${CLAUDE_LIMITS_REPO_RAW:-https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main}"
 APP="$HOME/Applications/ClaudeLimits.app"
 BIN="$APP/Contents/MacOS/ClaudeLimits"
-SOURCES=(Core.swift Parsers.swift Monitoring.swift App.swift)
+SOURCES=(Core.swift Parsers.swift Monitoring.swift Phone.swift App.swift)
 
 echo "==> ClaudeLimits: установка"
 
@@ -85,6 +85,7 @@ if [ -z "${CLAUDE_LIMITS_NO_LAUNCH:-}" ]; then
   echo ""
   echo "Готово! Значок появился в меню-баре."
   echo "Отправьте любое сообщение в Claude Code, чтобы появились цифры."
+  echo "Виджет на iPhone (Scriptable): \"$BIN\" --phone-setup"
 else
   echo "Готово (без запуска)."
 fi

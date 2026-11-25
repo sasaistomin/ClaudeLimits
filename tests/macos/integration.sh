@@ -140,12 +140,39 @@ sleep 3
 assert "kill -0 $pid 2>/dev/null" "приложение запускается и работает"
 kill $pid 2>/dev/null; wait $pid 2>/dev/null
 
+echo "== Виджет на телефоне (поддельный GitHub)"
+GH="$SB/fake-github"; mkdir -p "$GH"
+python3 "$REPO/tests/fake_github.py" "$GH" & ghpid=$!
+for _ in $(seq 50); do [ -f "$GH/port" ] && break; sleep 0.1; done
+export CLAUDE_LIMITS_GITHUB_API="http://127.0.0.1:$(cat "$GH/port")"
+out=$(CLAUDE_LIMITS_GITHUB_TOKEN=bad "$BIN" --phone-setup 2>&1); code=$?
+assert_eq "$code" 1 "--phone-setup с неверным токеном"
+assert_contains "$out" "401" "понятная ошибка про токен"
+out=$(CLAUDE_LIMITS_GITHUB_TOKEN=good "$BIN" --phone-setup 2>&1); code=$?
+assert_eq "$code" 0 "--phone-setup"
+assert_contains "$out" "ID для виджета:  g1" "напечатан ID gist"
+assert_eq "$(stat -f %Lp "$SB/.claude/limits-phone.json")" "600" "файл с токеном доступен только владельцу"
+assert_eq "$(json "$GH/g1.json" public)" "false" "gist секретный"
+payload 61 17 | "$BIN" --statusline >/dev/null
+"$BIN" >/dev/null 2>&1 &
+pid=$!
+for _ in $(seq 150); do grep -q "PATCH /gists/g1" "$GH/requests.log" 2>/dev/null && break; sleep 0.1; done
+kill $pid 2>/dev/null; wait $pid 2>/dev/null
+content=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['files']['claude-limits.json']['content'])" "$GH/g1.json" 2>/dev/null)
+assert_contains "$content" '"used" : 61' "приложение выгрузило цифры в gist"
+assert_contains "$("$BIN" --phone-status)" "g1" "--phone-status"
+"$BIN" --phone-disable >/dev/null
+assert "[ ! -e '$SB/.claude/limits-phone.json' ]" "--phone-disable удаляет токен"
+CLAUDE_LIMITS_GITHUB_TOKEN=good "$BIN" --phone-setup >/dev/null 2>&1
+kill $ghpid 2>/dev/null; wait $ghpid 2>/dev/null
+unset CLAUDE_LIMITS_GITHUB_API
+
 echo "== Удаление"
 echo '{"model":"opus","statusLine":{"type":"command","command":"\"'"$BIN"'\" --statusline"}}' > "$SETTINGS"
 bash "$REPO/macos/uninstall.sh" >/dev/null 2>&1; code=$?
 assert_eq "$code" 0 "uninstall.sh"
 assert "[ ! -e '$APP' ]" "приложение удалено"
-assert "[ ! -e '$LIMITS' ] && [ ! -e '$HIST' ]" "данные удалены"
+assert "[ ! -e '$LIMITS' ] && [ ! -e '$HIST' ] && [ ! -e '$SB/.claude/limits-phone.json' ]" "данные и токен для виджета удалены"
 assert_eq "$(json "$SETTINGS" statusLine.command)" "" "statusLine убран"
 assert_eq "$(json "$SETTINGS" model)" "opus" "остальные настройки сохранены"
 
