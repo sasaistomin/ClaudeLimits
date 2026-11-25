@@ -12,10 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Smoke
-        run: bash tests/smoke.sh
+        run: bash tests/ci-report.sh bash tests/smoke.sh
       - name: Все тесты
         if: always()
-        run: bash tests/macos/run.sh
+        run: bash tests/ci-report.sh bash tests/macos/run.sh
 
   windows:
     name: Windows — ${{ matrix.ps }}
@@ -27,12 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Smoke
-        shell: cmd
-        run: ${{ matrix.ps }} -NoProfile -ExecutionPolicy Bypass -File tests\windows\smoke.ps1
+        shell: bash
+        run: bash tests/ci-report.sh ${{ matrix.ps }} -NoProfile -ExecutionPolicy Bypass -File tests/windows/smoke.ps1
       - name: Тесты, установка, значок в трее, удаление
         if: always()
-        shell: cmd
-        run: ${{ matrix.ps }} -NoProfile -ExecutionPolicy Bypass -File tests\windows\run-tests.ps1
+        shell: bash
+        run: bash tests/ci-report.sh ${{ matrix.ps }} -NoProfile -ExecutionPolicy Bypass -File tests/windows/run-tests.ps1
 
   linux-logic:
     name: Linux — логика Windows-версии (pwsh)
@@ -40,10 +40,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Smoke
-        run: pwsh -NoProfile -File tests/windows/smoke.ps1
+        run: bash tests/ci-report.sh pwsh -NoProfile -File tests/windows/smoke.ps1
       - name: Все тесты
         if: always()
-        run: pwsh -NoProfile -File tests/windows/run-tests.ps1
+        run: bash tests/ci-report.sh pwsh -NoProfile -File tests/windows/run-tests.ps1
 
   linux:
     name: Linux (Ubuntu) — установка, значок в трее, тесты
@@ -53,10 +53,10 @@ jobs:
       - name: Пакеты (GTK, AppIndicator, виртуальный дисплей)
         run: sudo apt-get update && sudo apt-get install -y python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 libnotify-bin xvfb
       - name: Smoke
-        run: xvfb-run -a bash tests/smoke.sh
+        run: bash tests/ci-report.sh xvfb-run -a bash tests/smoke.sh
       - name: Все тесты
         if: always()
-        run: xvfb-run -a bash tests/linux/run.sh
+        run: bash tests/ci-report.sh xvfb-run -a bash tests/linux/run.sh
 
   linux-fresh:
     name: Linux — установка с нуля (${{ matrix.distro }})
