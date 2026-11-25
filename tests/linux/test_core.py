@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'linux'))
@@ -17,9 +18,14 @@ def read(path):
         return f.read()
 
 
-def win(raw, reset, now=NOW):
+def win(raw, reset, now=NOW, wid=core.FIVE, rolling=False):
     used = 0.0 if reset < now else raw
-    return {'used': used, 'raw': raw, 'left': max(0, 100 - used), 'reset': reset}
+    return {'id': wid, 'used': used, 'raw': raw, 'left': max(0, 100 - used), 'reset': reset, 'rolling': rolling}
+
+
+class Metrics:
+    def __init__(self, source, status='Ok', windows=()):
+        self.source, self.status, self.windows = source, status, list(windows)
 
 
 class Sandbox(unittest.TestCase):
@@ -66,8 +72,24 @@ class TestStrings(unittest.TestCase):
         self.assertEqual([core.level(u) for u in (0, 69.9, 70, 89, 90, 100)],
                          ['green', 'green', 'yellow', 'yellow', 'red', 'red'])
         self.assertEqual(core.indicator_label(None), '—')
-        self.assertEqual(core.indicator_label({core.FIVE: win(42.4, NOW + 60), core.WEEK: None}), '58%')
-        self.assertEqual(core.indicator_label({core.FIVE: None, core.WEEK: win(10, NOW + 60)}), '90%')
+        self.assertEqual(core.indicator_label(Metrics('code', windows=[win(42.4, NOW + 60)])), '58%')
+        self.assertEqual(core.indicator_label(Metrics('code', windows=[win(10, NOW + 60, wid=core.WEEK)])), '90%')
+        self.assertEqual(core.indicator_label(Metrics('desktop', 'NotFound')), '—')
+        self.assertEqual(core.worst_used(Metrics('code', windows=[win(10, NOW + 60), win(75, NOW + 60, wid=core.WEEK)])), 75)
+
+    def test_tooltip_and_cards(self):
+        code = Metrics('code', windows=[win(14, NOW + 3600), win(51, NOW + 9000, wid=core.WEEK)])
+        desk = Metrics('desktop', windows=[win(18, NOW + 7800, rolling=True)])
+        self.assertEqual(core.tray_tooltip([code, desk], EN), 'Code: 5h 86% · week 49% | Desktop: 5h 82%')
+        self.assertEqual(core.tray_tooltip([None, Metrics('desktop', 'NotFound')], RU), RU['no_data_long'])
+        self.assertEqual(core.window_lines(code.windows[0], RU, NOW),
+                         ('5 часов: осталось 86% (использовано 14%)', '    сброс через 1 ч 0 мин'))
+        at = time.strftime('%H:%M', time.localtime(NOW + 7800))
+        self.assertEqual(core.window_lines(desk.windows[0], EN, NOW),
+                         ('5-hour window (rolling): 82% left (18% used)', '    resets at {0} (in 2h 10m)'.format(at)))
+        self.assertEqual(core.empty_state_lines('desktop', None, RU)[0], RU['loading'])
+        self.assertEqual(core.empty_state_lines('desktop', Metrics('desktop', 'NotFound'), RU)[0], 'Claude Desktop: не подключено')
+        self.assertEqual(core.empty_state_lines('code', Metrics('code', 'NoData'), RU)[0], RU['no_data_long'])
 
 
 class TestLimits(Sandbox):
@@ -123,12 +145,58 @@ class TestNotify(unittest.TestCase):
 
     def test_format(self):
         title, body, urg = core.format_notification({'type': 'low', 'threshold': 95, 'used': 96},
-                                                    win(96, NOW + 3600), True, RU, NOW)
-        self.assertEqual(title, 'Claude: осталось 4%')
+                                                    win(96, NOW + 3600), 'code', RU, NOW)
+        self.assertEqual(title, '[Claude Code] Осталось 4%')
         self.assertEqual(body, '5-часовое окно израсходовано на 96%. Сброс через 1 ч 0 мин.')
         self.assertEqual(urg, 'critical')
-        self.assertEqual(core.format_notification({'type': 'reset'}, win(90, NOW), False, EN, NOW)[0],
-                         'Claude limit has reset')
+        self.assertEqual(core.format_notification({'type': 'reset'}, win(90, NOW, wid=core.WEEK), 'code', EN, NOW)[:2],
+                         ('[Claude Code] Limit has reset', "The weekly limit has reset — you're good to go."))
+
+    def test_desktop_rolling(self):
+        n = {}
+        w = win(100, NOW + 5400, rolling=True)
+        self.assertEqual(core.notify_key('desktop', w), 'desktop:five_hour')
+        self.assertEqual(core.notify_key('code', w), 'five_hour')
+        ev = core.notify_event(core.notify_key('desktop', w), w, n, NOW, core.notify_thresholds(w))
+        self.assertEqual(ev['threshold'], 100)
+        self.assertEqual(set(n), {'desktop:five_hour:100', 'desktop:five_hour:95', 'desktop:five_hour:80'})
+        at = time.strftime('%H:%M', time.localtime(NOW + 5400))
+        title, body, _ = core.format_notification(ev, w, 'desktop', RU, NOW)
+        self.assertEqual(title, '[Claude Desktop] Осталось 0%')
+        self.assertEqual(body, '5-часовое окно сообщений исчерпано. Сброс в {0}.'.format(at))
+        body = core.format_notification({'type': 'low', 'threshold': 80, 'used': 84}, w, 'desktop', EN, NOW)[1]
+        self.assertEqual(body, '5-hour message window is 84% used. Resets at {0}.'.format(at))
+
+
+class TestUpdates(Sandbox):
+    def test_versions(self):
+        self.assertTrue(core.is_newer('2.1.0', '2.0.0'))
+        self.assertTrue(core.is_newer('2.0.10', '2.0.9'))
+        self.assertTrue(core.is_newer('v3', '2.9.9'))
+        self.assertTrue(core.is_newer('2.0.0\n', '1.0'))
+        self.assertTrue(core.is_newer('2.0.0', '0.0.0'))
+        self.assertFalse(core.is_newer('2.0.0', '2.0.0'))
+        self.assertFalse(core.is_newer('1.9.0', '2.0.0'))       # старая версия на GitHub — не откатываемся
+        self.assertFalse(core.is_newer('', '2.0.0'))
+        self.assertFalse(core.is_newer('<html>404</html>', '0.0.0'))
+        self.assertEqual(core.version_parts('2.10.1-beta'), [2, 10, 1])
+
+    def test_installed_and_remote(self):
+        d = self.dir.name
+        self.assertEqual(core.installed_version(d), '0.0.0')
+        with open(os.path.join(d, 'VERSION'), 'w') as f:
+            f.write('2.0.0\n')
+        self.assertEqual(core.installed_version(d), '2.0.0')
+        old = os.environ.get('CLAUDE_LIMITS_REPO_RAW')
+        try:
+            os.environ['CLAUDE_LIMITS_REPO_RAW'] = 'file://' + d
+            self.assertEqual(core.fetch_remote_version(), '2.0.0')
+            self.assertEqual(core.update_command()[-1], 'file://' + d)
+            os.environ['CLAUDE_LIMITS_REPO_RAW'] = 'file://' + d + '/nope'
+            with self.assertRaises(Exception):
+                core.fetch_remote_version()
+        finally:
+            os.environ.pop('CLAUDE_LIMITS_REPO_RAW', None) if old is None else os.environ.__setitem__('CLAUDE_LIMITS_REPO_RAW', old)
 
 
 class TestChart(unittest.TestCase):
@@ -220,10 +288,13 @@ class TestSettings(Sandbox):
 
     def test_config_and_autostart(self):
         cfg = core.read_config()
-        self.assertEqual(cfg, {'language': 'system', 'notifications': True, 'notified': {}})
-        cfg.update(language='ru', notifications=False, notified={'five_hour:80': 123})
+        self.assertEqual(cfg, {'language': 'system', 'notifications': True, 'notified': {},
+                               'active_tab': 0, 'desktop_path': ''})
+        cfg.update(language='ru', notifications=False, notified={'five_hour:80': 123}, active_tab=1, desktop_path='/x/Claude')
         core.save_config(cfg)
         self.assertEqual(core.read_config(), cfg)
+        core.save_config({'active_tab': 9, 'desktop_path': 5})
+        self.assertEqual((core.read_config()['active_tab'], core.read_config()['desktop_path']), (0, ''))
         core.set_autostart(True, '/a b/claude_limits.py')
         self.assertTrue(core.autostart_enabled())
         self.assertIn('Exec=python3 "/a b/claude_limits.py"', read(core.autostart_path()))

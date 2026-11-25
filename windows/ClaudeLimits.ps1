@@ -1,5 +1,5 @@
-﻿# ClaudeLimits for Windows — значок в трее с остатком лимитов Claude.
-# Читает ~/.claude/limits.json, который пишет statusline.ps1 из Claude Code.
+﻿# ClaudeLimits for Windows — значок в трее с остатком лимитов Claude (вкладки «Claude Code» и «Claude Desktop»).
+# UI-слой: данные приходят от LimitMonitoringService (фоновые runspace), настройки — из config.json.
 # Запуск: powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ClaudeLimits.ps1
 
 $ErrorActionPreference = 'Stop'
@@ -23,21 +23,26 @@ $mutexName = if ($SelfTest) { "Local\ClaudeLimitsSelfTest$PID" } else { 'Local\C
 $mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 if (-not $createdNew) { exit 0 }
 
-$LimitsFile = Join-Path $env:USERPROFILE '.claude\limits.json'
 $StartupDir = if ($env:CLAUDE_LIMITS_STARTUP_DIR) { $env:CLAUDE_LIMITS_STARTUP_DIR } else { [Environment]::GetFolderPath('Startup') }
 $StartupLnk = Join-Path $StartupDir 'ClaudeLimits.lnk'
 $ScriptPath = $MyInvocation.MyCommand.Path
 $ConfigFile = Join-Path (Split-Path -Parent $ScriptPath) 'config.json'
 
 . (Join-Path $PSScriptRoot 'ClaudeLimits.Core.ps1')
+. (Join-Path $PSScriptRoot 'ClaudeLimits.Monitoring.ps1')
 
-$HistoryFile = Join-Path $env:USERPROFILE '.claude\limits-history.jsonl'
+$HistoryFiles = @{
+    code    = Join-Path $env:USERPROFILE '.claude\limits-history.jsonl'
+    desktop = Join-Path $env:USERPROFILE '.claude\limits-desktop-history.jsonl'
+}
 $script:Config = Read-Config $ConfigFile
 $script:LangSetting = $script:Config.language
 $script:T = $Strings[(Resolve-Lang $script:LangSetting)]
 
 function Save-Settings { Save-Config $script:Config $ConfigFile }
-function Get-Limits { Read-Limits $LimitsFile }
+function Get-ActiveSource { $Sources[$script:Config.active_tab] }
+
+$script:Monitor = [LimitMonitoringService]::new((Join-Path $PSScriptRoot 'ClaudeLimits.Parsers.ps1'))
 
 # ---------- уведомления ----------
 
@@ -48,13 +53,18 @@ function Send-Notification([string]$title, [string]$body, [string]$kind = 'Info'
     $tray.ShowBalloonTip(10000)
 }
 
-# Проверяет одно окно лимита; каждое уведомление — один раз на окно (правила — в Core).
-function Test-WindowNotify([string]$key, [hashtable]$w, [bool]$five) {
-    $ev = Get-NotifyEvent $key $w $script:Config.notified
-    if ($ev) {
-        $n = Format-Notification $ev $w $five $script:T
-        Send-Notification $n.Title $n.Body $n.Icon
-        Save-Settings
+# Каждое уведомление — один раз на окно и источник (правила — в Core).
+function Test-SourceNotify([string]$source) {
+    if (-not $script:Config.notifications) { return }
+    $m = $script:Monitor.Latest[$source]
+    if (-not $m -or $m.Status -ne 'Ok') { return }
+    foreach ($w in $m.Windows) {
+        $ev = Get-NotifyEvent (Get-NotifyKey $source $w) $w $script:Config.notified (Get-UnixNow) (Get-NotifyThresholds $w)
+        if ($ev) {
+            $n = Format-Notification $ev $w $source $script:T
+            Send-Notification $n.Title $n.Body $n.Icon
+            Save-Settings
+        }
     }
 }
 
@@ -105,7 +115,11 @@ $script:ChartKind = 'five'
 $script:HoverX = -1
 $AccentColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
 
-function Get-CurrentChartModel { Get-ChartModel (Get-Limits) (Read-History $HistoryFile) ($script:ChartKind -eq 'five') }
+function Get-CurrentChartModel {
+    $id = if ($script:ChartKind -eq 'five') { 'five_hour' } else { 'seven_day' }
+    $source = Get-ActiveSource
+    Get-ChartModel (Get-MetricsWindow $script:Monitor.Latest[$source] $id) (Read-History $HistoryFiles[$source])
+}
 
 function Draw-Chart($g, [int]$W, [int]$H) {
     $g.SmoothingMode = 'AntiAlias'
@@ -272,15 +286,42 @@ $tray = New-Object System.Windows.Forms.NotifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $miTitle   = $menu.Items.Add('');  $miTitle.Font = New-Object System.Drawing.Font($miTitle.Font, [System.Drawing.FontStyle]::Bold); $miTitle.Enabled = $false
-$miFive    = $menu.Items.Add(''); $miFive.Enabled = $false
-$miFiveR   = $menu.Items.Add(''); $miFiveR.Enabled = $false
-$miWeek    = $menu.Items.Add(''); $miWeek.Enabled = $false
-$miWeekR   = $menu.Items.Add(''); $miWeekR.Enabled = $false
+
+$tabPanel = New-Object System.Windows.Forms.TableLayoutPanel
+$tabPanel.Size = New-Object System.Drawing.Size(260, 28)
+$tabPanel.ColumnCount = $Sources.Count
+$tabPanel.BackColor = [System.Drawing.Color]::Transparent
+$tabButtons = @()
+for ($i = 0; $i -lt $Sources.Count; $i++) {
+    [void]$tabPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, (100 / $Sources.Count))))
+    $b = New-Object System.Windows.Forms.RadioButton
+    $b.Appearance = 'Button'; $b.FlatStyle = 'Flat'; $b.TextAlign = 'MiddleCenter'
+    $b.Dock = 'Fill'; $b.Margin = New-Object System.Windows.Forms.Padding(0)
+    $b.FlatAppearance.BorderColor = $AccentColor
+    $b.FlatAppearance.CheckedBackColor = $AccentColor
+    $b.Text = $SourceNames[$Sources[$i]]; $b.Tag = $i
+    $b.Add_Click({ param($s, $e) Set-ActiveTab ([int]$s.Tag) })
+    $tabPanel.Controls.Add($b, $i, 0)
+    $tabButtons += $b
+}
+$miTabs = New-Object System.Windows.Forms.ToolStripControlHost($tabPanel)
+$miTabs.AutoSize = $false
+$miTabs.Size = $tabPanel.Size
+$miTabs.Margin = New-Object System.Windows.Forms.Padding(6, 2, 6, 4)
+$menu.Items.Add($miTabs) | Out-Null
+
+$miRows    = @(foreach ($i in 1..4) { $r = $menu.Items.Add(''); $r.Enabled = $false; $r })
 $miUpdated = $menu.Items.Add(''); $miUpdated.Enabled = $false
-$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+$sepChart  = New-Object System.Windows.Forms.ToolStripSeparator
+$menu.Items.Add($sepChart) | Out-Null
 $miChart   = $menu.Items.Add('')
 $miChart.Font = New-Object System.Drawing.Font($miChart.Font, [System.Drawing.FontStyle]::Bold)
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+$miDesktop     = New-Object System.Windows.Forms.ToolStripMenuItem
+$menu.Items.Add($miDesktop) | Out-Null
+$miDesktopPath = $miDesktop.DropDownItems.Add(''); $miDesktopPath.Enabled = $false
+$miDesktopAuto = $miDesktop.DropDownItems.Add('')
+$miDesktopPick = $miDesktop.DropDownItems.Add('')
 $miStartup = $menu.Items.Add('')
 $miNotif  = $menu.Items.Add('')
 $miLang   = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -288,6 +329,7 @@ $menu.Items.Add($miLang) | Out-Null
 $miLangSys = $miLang.DropDownItems.Add('')
 $miLangRu  = $miLang.DropDownItems.Add('Русский')
 $miLangEn  = $miLang.DropDownItems.Add('English')
+$miUpdate  = $menu.Items.Add('')
 $miQuit    = $menu.Items.Add('')
 
 $tray.ContextMenuStrip = $menu
@@ -298,51 +340,81 @@ function Update-StaticTexts {
     $miTitle.Text   = $T.Title
     $miChart.Text   = $T.Chart
     $miStartup.Text = $T.Startup
+    $miDesktop.Text = $T.DesktopFolder
+    $miDesktopAuto.Text = $T.DesktopAuto
+    $miDesktopPick.Text = $T.DesktopPick
+    $miDesktopAuto.Checked = -not $script:Config.desktop_path
     $miNotif.Text   = $T.Notifications
     $miNotif.Checked = [bool]$script:Config.notifications
     $miLang.Text    = $T.Language
     $miLangSys.Text = $T.System
     $miQuit.Text    = $T.Quit
+    Set-UpdateState $script:UpdateState.Kind $script:UpdateState.Version
     $miLangSys.Checked = ($script:LangSetting -eq 'system')
     $miLangRu.Checked  = ($script:LangSetting -eq 'ru')
     $miLangEn.Checked  = ($script:LangSetting -eq 'en')
 }
 
+function Update-Tabs {
+    $active = $script:Config.active_tab
+    for ($i = 0; $i -lt $tabButtons.Count; $i++) {
+        $b = $tabButtons[$i]
+        $b.Checked = ($i -eq $active)
+        $b.ForeColor = if ($b.Checked) { [System.Drawing.Color]::White } else { [System.Drawing.SystemColors]::ControlText }
+        $b.BackColor = if ($b.Checked) { $AccentColor } else { [System.Drawing.SystemColors]::Window }
+    }
+}
+
+function Set-Rows([string[]]$lines) {
+    for ($i = 0; $i -lt $miRows.Count; $i++) {
+        $text = if ($i -lt $lines.Count) { $lines[$i] } else { '' }
+        $miRows[$i].Text = $text
+        $miRows[$i].Visible = [bool]$text
+    }
+}
+
 function Update-UI {
     $T = $script:T
-    $l = Get-Limits
-    if (-not $l -or (-not $l.Five -and -not $l.Week)) {
+    $source = Get-ActiveSource
+    $m = $script:Monitor.Latest[$source]
+    Update-Tabs
+    $desktop = $script:Monitor.Latest['desktop']
+    $miDesktopPath.Text = if ($desktop -and $desktop.LogPath) { $desktop.LogPath } else { $T.DesktopNoPath }
+    $tray.Text = Get-TrayTooltip @($script:Monitor.Latest['code'], $desktop) $T
+
+    if (-not $m -or $m.Status -ne 'Ok' -or $m.Windows.Count -eq 0) {
         Set-TrayIcon '–' ([System.Drawing.Color]::Gray)
-        $tray.Text = Get-TrayTooltip $l $T
-        $miFive.Text = $T.NoDataLong
-        $miFiveR.Text = $T.SendMsg
-        $miWeek.Visible = $false; $miWeekR.Visible = $false; $miUpdated.Visible = $false
+        Set-Rows (Get-EmptyStateLines $source $m $T)
+        $miUpdated.Visible = $false
         return
     }
-    $miWeek.Visible = $true; $miWeekR.Visible = $true; $miUpdated.Visible = $true
 
-    $worst = 0
-    if ($l.Five) {
-        $miFive.Text  = ($T.LeftUsed -f $T.Five, [math]::Round($l.Five.Left), [math]::Round($l.Five.Used))
-        $miFiveR.Text = '      ' + ($T.Reset -f (Format-Countdown $l.Five.Reset $T))
-        $worst = [math]::Max($worst, $l.Five.Used)
-    } else { $miFive.Text = "$($T.Five): $($T.NoData)"; $miFiveR.Text = '' }
-    if ($l.Week) {
-        $miWeek.Text  = ($T.LeftUsed -f $T.Week, [math]::Round($l.Week.Left), [math]::Round($l.Week.Used))
-        $miWeekR.Text = '      ' + ($T.Reset -f (Format-Countdown $l.Week.Reset $T))
-        $worst = [math]::Max($worst, $l.Week.Used)
-    } else { $miWeek.Text = "$($T.Week): $($T.NoData)"; $miWeekR.Text = '' }
-    $miUpdated.Text = ($T.Updated -f (Format-Ago $l.Updated $T))
-
-    $main = if ($l.Five) { $l.Five } else { $l.Week }
-    Set-TrayIcon ([string][math]::Round($main.Left)) (Get-LevelColor $worst)
-
-    $tray.Text = Get-TrayTooltip $l $T
-
-    if ($script:Config.notifications) {
-        if ($l.Five) { Test-WindowNotify 'five_hour' $l.Five $true }
-        if ($l.Week) { Test-WindowNotify 'seven_day' $l.Week $false }
+    $lines = @(); $worst = 0
+    foreach ($w in $m.Windows) {
+        $lines += Format-WindowLines $w $T
+        $worst = [math]::Max($worst, $w.Used)
     }
+    Set-Rows $lines
+    $miUpdated.Visible = $true
+    $miUpdated.Text = ($T.Updated -f (Format-Ago $m.Updated $T))
+    Set-TrayIcon ([string][math]::Round($m.Windows[0].Left)) (Get-LevelColor $worst)
+}
+
+function Set-ActiveTab([int]$index) {
+    if ($script:Config.active_tab -ne $index) {
+        $script:Config.active_tab = $index
+        Save-Settings
+    }
+    Update-UI
+    Update-Chart
+}
+
+function Set-DesktopPath([string]$path) {
+    $script:Config.desktop_path = $path
+    Save-Settings
+    $script:Monitor.Watch('desktop', $path)
+    Update-StaticTexts
+    Update-UI
 }
 
 function Set-Language([string]$lang) {
@@ -356,6 +428,18 @@ function Set-Language([string]$lang) {
 }
 
 $miChart.Add_Click({ Show-ChartForm })
+
+$miDesktopAuto.Add_Click({ if ($script:Config.desktop_path) { Set-DesktopPath '' } })
+$miDesktopPick.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    try {
+        $dlg.Description = $script:T.DesktopPickTitle
+        $dlg.ShowNewFolderButton = $false
+        if ($script:Config.desktop_path -and (Test-Path -LiteralPath $script:Config.desktop_path)) { $dlg.SelectedPath = $script:Config.desktop_path }
+        elseif ($env:APPDATA) { $dlg.SelectedPath = $env:APPDATA }
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Set-DesktopPath $dlg.SelectedPath }
+    } catch { } finally { $dlg.Dispose() }
+})
 
 $miNotif.Add_Click({
     $script:Config.notifications = -not $script:Config.notifications
@@ -384,8 +468,57 @@ $miStartup.Add_Click({
     Update-StartupCheck
 })
 
+# ---------- обновления ----------
+
+$script:UpdateState = @{ Kind = 'idle'; Version = $null }
+$script:UpdateJob = $null
+
+function Set-UpdateState([string]$kind, [string]$version) {
+    $script:UpdateState = @{ Kind = $kind; Version = $version }
+    $T = $script:T
+    $miUpdate.Text = switch ($kind) {
+        'checking'   { $T.CheckingUpdates }
+        'current'    { $T.UpToDate -f (Get-InstalledVersion $PSScriptRoot) }
+        'available'  { $T.UpdateTo -f $version }
+        'failed'     { $T.UpdateFailed }
+        'installing' { $T.InstallingUpdate }
+        default      { $T.CheckUpdates }
+    }
+    $miUpdate.Enabled = $kind -ne 'checking' -and $kind -ne 'installing'
+}
+
+function Start-UpdateCheck {
+    Set-UpdateState 'checking'
+    $shell = [powershell]::Create()
+    $def = ${function:Get-RemoteVersion}.ToString()
+    [void]$shell.AddScript("function Get-RemoteVersion { $def }`nGet-RemoteVersion `$args[0]").AddArgument("$(Get-RepoRaw)/VERSION")
+    $script:UpdateJob = @{ Shell = $shell; Handle = $shell.BeginInvoke() }
+}
+
+function Complete-UpdateCheck {
+    $job = $script:UpdateJob
+    if (-not $job -or -not $job.Handle.IsCompleted) { return }
+    $script:UpdateJob = $null
+    try {
+        $remote = [string](@($job.Shell.EndInvoke($job.Handle)) | Select-Object -Last 1)
+        if ($job.Shell.HadErrors -or -not $remote) { Set-UpdateState 'failed' }
+        elseif (Test-NewerVersion $remote (Get-InstalledVersion $PSScriptRoot)) { Set-UpdateState 'available' $remote }
+        else { Set-UpdateState 'current' }
+    } catch { Set-UpdateState 'failed' } finally { $job.Shell.Dispose() }
+}
+
+$miUpdate.Add_Click({
+    if ($script:UpdateState.Kind -eq 'available') {
+        Set-UpdateState 'installing' $script:UpdateState.Version
+        Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList (Get-UpdateArguments) -WindowStyle Hidden
+    } else {
+        Start-UpdateCheck
+    }
+})
+
 $miQuit.Add_Click({
     $timer.Stop()
+    $script:Monitor.Dispose()
     $tray.Visible = $false
     $tray.Dispose()
     [System.Windows.Forms.Application]::Exit()
@@ -402,10 +535,27 @@ $tray.Add_MouseClick({
     }
 })
 
+foreach ($source in $Sources) {
+    $script:Monitor.Subscribe($source, {
+        param($m)
+        if ($m.Source -eq 'desktop') { [void](Add-MetricsHistory $m $HistoryFiles.desktop) }
+        Test-SourceNotify $m.Source
+        if ($m.Source -eq (Get-ActiveSource)) { Update-UI }
+        if ($m.Source -eq (Get-ActiveSource) -and $script:ChartCtl) { Update-Chart }
+    })
+}
+$script:Monitor.Watch('code', '')
+$script:Monitor.Watch('desktop', $script:Config.desktop_path)
+
+$script:Tick = 0
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 5000
+$timer.Interval = 1000
 $timer.Add_Tick({
-    try { Update-UI } catch { }
+    try { [void]$script:Monitor.Dispatch() } catch { }
+    try { Complete-UpdateCheck } catch { }
+    $script:Tick++
+    if ($script:Tick % 5 -ne 0) { return }
+    try { Update-UI; foreach ($source in $Sources) { Test-SourceNotify $source } } catch { }
     if ($script:ChartCtl) { try { Update-Chart } catch { } }
 })
 $timer.Start()
@@ -417,7 +567,20 @@ Update-StartupCheck
 if ($SelfTest) {
     # Автотест (CI): прогоняем весь интерфейс без показа пользователю; любая ошибка -> код выхода 1
     try {
+        if (-not $script:Monitor.WaitForAll(30000)) {
+            throw ('monitoring timeout: ' + (($Sources | ForEach-Object { "$_=" + $script:Monitor.Fault($_) }) -join '; '))
+        }
         foreach ($lang in @('en', 'ru', 'system')) { Set-Language $lang }
+        $tabs = @()
+        for ($i = $Sources.Count - 1; $i -ge 0; $i--) {
+            Set-ActiveTab $i
+            $tabs += '{0}: {1}' -f $Sources[$i], $miRows[0].Text
+        }
+        $script:Monitor.Watch('desktop', (Join-Path ([IO.Path]::GetTempPath()) "cl-missing-$PID"))
+        if (-not $script:Monitor.WaitForAll(10000)) { throw 'monitoring timeout after desktop path change' }
+        Set-ActiveTab 1
+        if ($miRows[0].Text -ne $script:T.DesktopNotFound) { throw "desktop not-found state: $($miRows[0].Text)" }
+        Set-ActiveTab 0
         Update-UI
         Update-StartupCheck
         Show-ChartForm
@@ -434,17 +597,19 @@ if ($SelfTest) {
         $label = $script:ChartCtl.Lbl.Text
         $script:ChartCtl.Form.Close()
         Send-Notification $script:T.NotifOnTitle $script:T.NotifOnBody
-        Write-Output "SELFTEST OK | tooltip: $($tray.Text) | menu: $($miFive.Text) | chart: $label"
+        Write-Output "SELFTEST OK | tooltip: $($tray.Text) | $($tabs -join ' | ') | chart: $label"
         $code = 0
     } catch {
         Write-Output "SELFTEST FAIL: $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
         $code = 1
     }
-    $timer.Stop(); $tray.Visible = $false; $tray.Dispose()
+    $timer.Stop(); $script:Monitor.Dispose(); $tray.Visible = $false; $tray.Dispose()
     $mutex.ReleaseMutex()
     exit $code
 }
 
 [System.Windows.Forms.Application]::Run()
+
+$script:Monitor.Dispose()
 
 $mutex.ReleaseMutex()

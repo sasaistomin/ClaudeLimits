@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_RAW="${CLAUDE_LIMITS_REPO_RAW:-https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main}"
 INSTALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claude-limits"
-FILES="claude_limits_core.py claude_limits.py statusline.py uninstall.sh"
+FILES="claude_limits_core.py claude_limits_parsers.py claude_limits_monitor.py claude_limits.py statusline.py uninstall.sh"
 
 echo "==> ClaudeLimits: установка"
 
@@ -72,6 +72,12 @@ for f in $FILES; do
   else echo "    скачиваю $f"; curl -fsSL "$REPO_RAW/linux/$f" -o "$INSTALL_DIR/$f"; fi
 done
 chmod +x "$INSTALL_DIR"/*.py "$INSTALL_DIR/uninstall.sh"
+# Версия (для пункта «Проверить обновления»): VERSION в корне проекта или на GitHub
+if [ -n "$SRC" ] && [ -f "$SRC/../VERSION" ]; then VERSION="$(cat "$SRC/../VERSION")"
+else VERSION="$(curl -fsSL "$REPO_RAW/VERSION" 2>/dev/null || true)"; fi
+VERSION="$(printf '%s' "$VERSION" | head -1 | tr -cd '0-9.')"
+printf '%s\n' "${VERSION:-0.0.0}" > "$INSTALL_DIR/VERSION"
+echo "==> Версия ${VERSION:-0.0.0}"
 
 # 4. statusLine в ~/.claude/settings.json + автозапуск
 python3 "$INSTALL_DIR/claude_limits_core.py" install "$INSTALL_DIR"

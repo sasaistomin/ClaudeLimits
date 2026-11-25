@@ -5,15 +5,18 @@
 //   ClaudeLimits --statusline            — statusline-команда для Claude Code (stdin -> ~/.claude/limits.json)
 //   ClaudeLimits --install               — прописать statusline в ~/.claude/settings.json
 //   ClaudeLimits --uninstall             — убрать statusline из ~/.claude/settings.json
-//   ClaudeLimits --snapshot out.png [week] [dark] — сохранить окно в PNG (отладка)
+//   ClaudeLimits --check-update          — сравнить версию с VERSION на GitHub (код выхода 10 — есть обновление)
+//   ClaudeLimits --snapshot out.png [week] [dark] [desktop] — сохранить окно в PNG (отладка)
 //
-// Логика — в Core.swift, здесь только интерфейс.
+// Логика — в Core.swift, источники — в Parsers.swift, фоновый опрос — в Monitoring.swift; здесь только интерфейс.
+// Вкладки «Claude Code» / «Claude Desktop»; выбранная вкладка и папка Desktop хранятся в UserDefaults.
 
 import SwiftUI
 import Foundation
 import ServiceManagement
 import UserNotifications
 import Charts
+import AppKit
 
 // MARK: - Entry point
 
@@ -24,10 +27,21 @@ enum Main {
         if args.contains("--statusline") { StatusLine.run(); return }
         if args.contains("--install") { exit(Installer.install() ? 0 : 1) }
         if args.contains("--uninstall") { exit(Installer.uninstall() ? 0 : 1) }
+        if args.contains("--check-update") {
+            guard let data = try? Data(contentsOf: Updater.versionURL),
+                  let remote = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                print("installed \(Updater.installedVersion), remote unavailable"); exit(1)
+            }
+            let newer = Updater.isNewer(remote, than: Updater.installedVersion)
+            print("installed \(Updater.installedVersion), remote \(remote), update: \(newer ? "yes" : "no")")
+            exit(newer ? 10 : 0)
+        }
         if let i = args.firstIndex(of: "--snapshot"), args.index(after: i) < args.endIndex {
             // Отладка/скриншоты: --snapshot out.png [week] [dark]
             let rest = Array(args[args.index(after: i)...])
-            MainActor.assumeIsolated { Snapshot.render(to: rest[0], week: rest.contains("week"), dark: rest.contains("dark")) }
+            MainActor.assumeIsolated {
+                Snapshot.render(to: rest[0], week: rest.contains("week"), dark: rest.contains("dark"), desktop: rest.contains("desktop"))
+            }
             return
         }
         ClaudeLimitsApp.main()
@@ -64,41 +78,47 @@ enum Notifier {
         }
     }
 
-    /// Проверяет одно окно лимита и при необходимости шлёт уведомление (один раз на окно).
-    static func check(kind: String, window w: Window, l: L10n) {
+    /// Проверяет окна источника и при необходимости шлёт уведомление (один раз на окно и источник).
+    static func check(_ m: LimitMetrics, l: L10n) {
+        guard m.status == .ok else { return }
         var notified = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double] ?? [:]
-        let five = kind == "five_hour"
-        switch NotifyRules.decide(kind: kind, window: w, notified: &notified, now: Date().timeIntervalSince1970) {
-        case .low(_, let used)?:
-            send(l.lowTitle(max(0, 100 - used)),
-                 l.lowBody(five: five, used: used,
-                           countdown: l.countdown(to: Date(timeIntervalSince1970: w.resets_at))))
-        case .reset?:
-            send(l.resetTitle, l.resetBody(five: five))
-        case nil:
-            return
+        var changed = false
+        for w in m.windows {
+            let raw = Window(used_percentage: w.raw, resets_at: w.resetsAt)
+            guard let ev = NotifyRules.decide(kind: notifyKey(m.source, w), window: raw, notified: &notified,
+                                              now: Date().timeIntervalSince1970, thresholds: notifyThresholds(w)) else { continue }
+            let text = notificationText(ev, source: m.source, window: w, l: l)
+            send(text.title, text.body)
+            changed = true
         }
-        UserDefaults.standard.set(notified, forKey: defaultsKey)
+        if changed { UserDefaults.standard.set(notified, forKey: defaultsKey) }
     }
 }
 
 // MARK: - Store
 
-enum LoadError { case noFile, badFile }
-
 @MainActor
 final class LimitsStore: ObservableObject {
-    @Published var fiveHour: WindowState?
-    @Published var sevenDay: WindowState?
-    @Published var updatedAt: Date?
+    @Published var metrics: [LimitSource: LimitMetrics] = [:]
     @Published var history: [Sample] = []
+    @Published var desktopHistory: [Sample] = []
     @Published var chartKind: WindowKind = .fiveHour
     let hover = HoverModel()
-    private var historyModDate: Date?
-    @Published var error: LoadError?
+    let updates = UpdateModel()
+    let monitor = LimitMonitoringService()
+    private var historyModDates: [URL: Date] = [:]
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var language: AppLanguage {
         didSet { UserDefaults.standard.set(language.rawValue, forKey: "language") }
+    }
+    @Published var activeSource: LimitSource {
+        didSet { UserDefaults.standard.set(LimitSource.allCases.firstIndex(of: activeSource) ?? 0, forKey: "activeTab") }
+    }
+    @Published var desktopPath: String {
+        didSet {
+            UserDefaults.standard.set(desktopPath, forKey: "desktopPath")
+            monitor.watch(.desktop, path: desktopPath)
+        }
     }
 
     @Published var notificationsOn: Bool {
@@ -116,42 +136,65 @@ final class LimitsStore: ObservableObject {
     private var timer: Timer?
 
     init() {
-        language = AppLanguage(rawValue: UserDefaults.standard.string(forKey: "language") ?? "") ?? .system
-        notificationsOn = UserDefaults.standard.object(forKey: "notifications") as? Bool ?? true
+        let d = UserDefaults.standard
+        language = AppLanguage(rawValue: d.string(forKey: "language") ?? "") ?? .system
+        notificationsOn = d.object(forKey: "notifications") as? Bool ?? true
+        let tab = d.integer(forKey: "activeTab")
+        activeSource = LimitSource.allCases.indices.contains(tab) ? LimitSource.allCases[tab] : .code
+        desktopPath = d.string(forKey: "desktopPath") ?? ""
         UNUserNotificationCenter.current().delegate = notificationDelegate
         if notificationsOn { Notifier.requestAuthorization() }
-        reload()
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.reload() }
-        }
-    }
-
-    func reload() {
-        // История перечитывается только когда файл изменился
-        let mod = (try? FileManager.default.attributesOfItem(atPath: historyURL.path)[.modificationDate]) as? Date
-        if mod != historyModDate { historyModDate = mod; history = History.load() }
-
-        guard let data = try? Data(contentsOf: limitsURL) else { error = .noFile; return }
-        do {
-            let f = try JSONDecoder().decode(LimitsFile.self, from: data)
-            error = nil
-            updatedAt = Date(timeIntervalSince1970: f.updated_at)
-            fiveHour = Self.state(f.rate_limits.five_hour)
-            sevenDay = Self.state(f.rate_limits.seven_day)
-            if notificationsOn {
-                if let w = f.rate_limits.five_hour { Notifier.check(kind: "five_hour", window: w, l: l10n) }
-                if let w = f.rate_limits.seven_day { Notifier.check(kind: "seven_day", window: w, l: l10n) }
+        for source in LimitSource.allCases {
+            monitor.subscribe(source) { [weak self] m in
+                guard let self else { return }
+                self.metrics[m.source] = m
+                if m.source == .desktop {
+                    History.append(m, to: desktopHistoryURL)
+                    self.reloadHistory()
+                }
+                if self.notificationsOn { Notifier.check(m, l: self.l10n) }
             }
-        } catch {
-            self.error = .badFile
+        }
+        monitor.watch(.code)
+        monitor.watch(.desktop, path: desktopPath)
+        reloadHistory()
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
         }
     }
 
-    /// Если окно уже сбросилось — считаем, что использовано 0%.
-    private static func state(_ w: Window?) -> WindowState? {
-        guard let w else { return nil }
-        let reset = Date(timeIntervalSince1970: w.resets_at)
-        return WindowState(used: reset < Date() ? 0 : w.used_percentage, resetsAt: reset)
+    /// Раз в 5 секунд: история для графика, обратный отсчёт и уведомления о сбросе окна.
+    func refresh() {
+        reloadHistory()
+        objectWillChange.send()
+        if notificationsOn { metrics.values.forEach { Notifier.check($0, l: l10n) } }
+    }
+
+    private func reloadHistory() {
+        for url in [historyURL, desktopHistoryURL] {
+            let mod = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+            guard mod != historyModDates[url] else { continue }
+            historyModDates[url] = mod
+            if url == historyURL { history = History.load(url) } else { desktopHistory = History.load(url) }
+        }
+    }
+
+    var code: LimitMetrics? { metrics[.code] }
+    var active: LimitMetrics? { metrics[activeSource] }
+    var fiveHour: WindowState? { code?.window("five_hour")?.state }
+    var sevenDay: WindowState? { code?.window("seven_day")?.state }
+
+    func chooseDesktopFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.message = l10n.folderPanelTitle
+        panel.directoryURL = desktopPath.isEmpty ? home.appendingPathComponent("Library/Application Support")
+                                                 : URL(fileURLWithPath: desktopPath)
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url { desktopPath = url.path }
     }
 
     func setLaunchAtLogin(_ on: Bool) {
@@ -164,11 +207,89 @@ final class LimitsStore: ObservableObject {
     }
 
     var menuTitle: String {
-        guard let f = fiveHour else { return "—" }
-        return "\(Int(f.remaining.rounded()))%"
+        guard let w = active?.windows.first, active?.status == .ok else { return "—" }
+        return "\(Int(w.left.rounded()))%"
     }
 
-    var worstUsed: Double { max(fiveHour?.used ?? 0, sevenDay?.used ?? 0) }
+    var worstUsed: Double { active?.windows.map(\.used).max() ?? 0 }
+}
+
+// MARK: - Updates
+
+enum UpdateState: Equatable {
+    case idle, checking, upToDate, available(String), installing, failed
+}
+
+@MainActor
+final class UpdateModel: ObservableObject {
+    @Published var state: UpdateState = .idle
+
+    func check() {
+        state = .checking
+        var req = URLRequest(url: Updater.versionURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        req.setValue("ClaudeLimits", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+            let remote = ok ? data.flatMap { String(data: $0, encoding: .utf8) } : nil
+            Task { @MainActor in
+                guard let remote else { self.state = .failed; return }
+                let v = remote.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.state = Updater.isNewer(v, than: Updater.installedVersion) ? .available(v) : .upToDate
+            }
+        }.resume()
+    }
+
+    /// Скачивает install.sh и запускает его отдельным процессом: он соберёт новую версию,
+    /// остановит это приложение и откроет обновлённое.
+    func install() {
+        state = .installing
+        URLSession.shared.downloadTask(with: Updater.installerURL) { tmp, resp, _ in
+            guard (resp as? HTTPURLResponse)?.statusCode == 200, let tmp else {
+                Task { @MainActor in self.state = .failed }
+                return
+            }
+            let script = FileManager.default.temporaryDirectory.appendingPathComponent("claude-limits-update.sh")
+            try? FileManager.default.removeItem(at: script)
+            do { try FileManager.default.moveItem(at: tmp, to: script) } catch {
+                Task { @MainActor in self.state = .failed }
+                return
+            }
+            let log = home.appendingPathComponent("Library/Logs/ClaudeLimits-update.log")
+            try? FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: log.path, contents: nil)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = [script.path]
+            p.currentDirectoryURL = FileManager.default.temporaryDirectory
+            if let h = try? FileHandle(forWritingTo: log) { p.standardOutput = h; p.standardError = h }
+            do { try p.run() } catch { Task { @MainActor in self.state = .failed } }
+        }.resume()
+    }
+}
+
+struct UpdateButton: View {
+    @ObservedObject var model: UpdateModel
+    let l: L10n
+
+    var body: some View {
+        switch model.state {
+        case .idle, .failed, .upToDate:
+            HStack(spacing: 6) {
+                Button(l.checkUpdates) { model.check() }.controlSize(.small)
+                if model.state == .upToDate {
+                    Text(l.upToDate(Updater.installedVersion)).font(.caption).foregroundStyle(.secondary)
+                } else if model.state == .failed {
+                    Text(l.updateFailed).font(.caption).foregroundStyle(.red)
+                }
+            }
+        case .checking:
+            HStack(spacing: 6) { ProgressView().controlSize(.small); Text(l.checkingUpdates).font(.caption) }
+        case .available(let v):
+            Button(l.updateTo(v)) { model.install() }.controlSize(.small).buttonStyle(.borderedProminent)
+        case .installing:
+            HStack(spacing: 6) { ProgressView().controlSize(.small); Text(l.installingUpdate).font(.caption) }
+        }
+    }
 }
 
 // MARK: - Helpers
@@ -187,6 +308,7 @@ struct WindowRow: View {
     let title: String
     let state: WindowState?
     let l: L10n
+    var rolling = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -204,7 +326,8 @@ struct WindowRow: View {
             ProgressView(value: min(1, (state?.used ?? 0) / 100))
                 .tint(color(for: state?.used ?? 0))
             if let s = state {
-                Text(l.usedReset(Int(s.used.rounded()), l.countdown(to: s.resetsAt)))
+                Text(rolling && s.resetsAt > Date() ? l.usedResetAt(Int(s.used.rounded()), s.resetsAt)
+                                                    : l.usedReset(Int(s.used.rounded()), l.countdown(to: s.resetsAt)))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -331,23 +454,15 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text(l.title).font(.title3.bold())
 
-            switch store.error {
-            case .noFile?: Text(l.noFile).font(.callout).foregroundStyle(.secondary)
-            case .badFile?: Text(l.badFile).font(.callout).foregroundStyle(.secondary)
-            case nil:
-                WindowRow(title: l.fiveHour, state: store.fiveHour, l: l)
-                WindowRow(title: l.week, state: store.sevenDay, l: l)
+            Picker("", selection: $store.activeSource) {
+                ForEach(LimitSource.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
-                Picker("", selection: $store.chartKind) {
-                    Text(l.tab5h).tag(WindowKind.fiveHour)
-                    Text(l.tabWeek).tag(WindowKind.week)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-
-                UsageChart(kind: store.chartKind,
-                           state: store.chartKind == .fiveHour ? store.fiveHour : store.sevenDay,
-                           history: store.history, l: l, hoverModel: store.hover)
+            switch store.activeSource {
+            case .code: CodeTab(store: store, l: l)
+            case .desktop: DesktopTab(store: store, l: l)
             }
 
             Divider()
@@ -367,9 +482,11 @@ struct PopoverView: View {
             .pickerStyle(.menu)
             .fixedSize()
 
+            UpdateButton(model: store.updates, l: l)
+
             HStack {
-                if let u = store.updatedAt {
-                    Text(l.updated(u)).font(.caption).foregroundStyle(.secondary)
+                if let m = store.active, m.status == .ok {
+                    Text(l.updated(Date(timeIntervalSince1970: m.updated))).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button(l.quit) { NSApplication.shared.terminate(nil) }
@@ -379,6 +496,77 @@ struct PopoverView: View {
         .padding(16)
         .frame(width: 340)
         .environment(\.locale, l.locale)
+    }
+}
+
+struct CodeTab: View {
+    @ObservedObject var store: LimitsStore
+    let l: L10n
+
+    var body: some View {
+        switch store.code?.status {
+        case nil: Text(l.loading).font(.callout).foregroundStyle(.secondary)
+        case .invalid?: Text(l.badFile).font(.callout).foregroundStyle(.secondary)
+        case .noData?, .notFound?: Text(l.noFile).font(.callout).foregroundStyle(.secondary)
+        case .ok?:
+            WindowRow(title: l.fiveHour, state: store.fiveHour, l: l)
+            WindowRow(title: l.week, state: store.sevenDay, l: l)
+
+            Picker("", selection: $store.chartKind) {
+                Text(l.tab5h).tag(WindowKind.fiveHour)
+                Text(l.tabWeek).tag(WindowKind.week)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            UsageChart(kind: store.chartKind,
+                       state: store.chartKind == .fiveHour ? store.fiveHour : store.sevenDay,
+                       history: store.history, l: l, hoverModel: store.hover)
+        }
+    }
+}
+
+struct DesktopTab: View {
+    @ObservedObject var store: LimitsStore
+    let l: L10n
+
+    var body: some View {
+        let m = store.metrics[.desktop]
+        VStack(alignment: .leading, spacing: 10) {
+            switch m?.status {
+            case nil: Text(l.loading).font(.callout).foregroundStyle(.secondary)
+            case .notFound?:
+                Text(l.desktopNotFound).font(.headline)
+                Text(l.desktopNotFoundHint).font(.callout).foregroundStyle(.secondary)
+            case .noData?, .invalid?: Text(l.desktopNoData).font(.callout).foregroundStyle(.secondary)
+            case .ok?:
+                ForEach(m?.windows ?? [], id: \.id) { w in
+                    WindowRow(title: w.rolling ? l.rolling : (w.id == "five_hour" ? l.fiveHour : l.week),
+                              state: w.state, l: l, rolling: w.rolling)
+                }
+
+                Picker("", selection: $store.chartKind) {
+                    Text(l.tab5h).tag(WindowKind.fiveHour)
+                    Text(l.tabWeek).tag(WindowKind.week)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                UsageChart(kind: store.chartKind,
+                           state: m?.window(store.chartKind == .fiveHour ? "five_hour" : "seven_day")?.state,
+                           history: store.desktopHistory, l: l, hoverModel: store.hover)
+            }
+            HStack(spacing: 6) {
+                Text(m?.logPath.isEmpty == false ? m!.logPath : l.desktopNotFound)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                if !store.desktopPath.isEmpty {
+                    Button(l.autoFolder) { store.desktopPath = "" }.controlSize(.small)
+                }
+                Button(l.chooseFolder) { store.chooseDesktopFolder() }.controlSize(.small)
+            }
+        }
     }
 }
 
@@ -403,9 +591,13 @@ struct ClaudeLimitsApp: App {
 
 @MainActor
 enum Snapshot {
-    static func render(to path: String, week: Bool, dark: Bool) {
+    static func render(to path: String, week: Bool, dark: Bool, desktop: Bool) {
         let store = LimitsStore()
+        store.monitor.waitForAll(timeout: 10)
         store.chartKind = week ? .week : .fiveHour
+        let previous = store.activeSource
+        store.activeSource = desktop ? .desktop : .code
+        defer { store.activeSource = previous }
         let view = PopoverView(store: store)
             .background(dark ? Color(white: 0.15) : Color(white: 0.97))
             .environment(\.colorScheme, dark ? .dark : .light)

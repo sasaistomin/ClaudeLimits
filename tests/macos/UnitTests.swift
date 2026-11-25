@@ -25,6 +25,83 @@ func test(_ name: String, _ body: () -> Void) {
 let now: Double = 1_800_000_000
 let nowDate = Date(timeIntervalSince1970: now)
 
+// MARK: - Поддельные данные Claude Desktop (LevelDB)
+
+func desktopRecord(_ util: Double, _ reset: Double, _ observed: Double, atWall: Bool = false) -> String {
+    "{\"resetsAt\":\(Int(reset)),\"utilization\":\(util),\"prevUtilization\":0.1,\"observedAt\":\(observed),\"atWall\":\(atWall),\"fired\":[],\"shown\":false}"
+}
+
+func journalEntry(_ json: String) -> Data {
+    Data([0x9a, 0x01, 0x00, 0x00, 0x01]) + Data("_https://claude.ai".utf8) + Data([0x00, 0x01]) + Data("ochre.test".utf8)
+        + Data([0x8f, 0x01]) + json.data(using: .isoLatin1)! + Data([0x00, 0x7b, 0xff])
+}
+
+func varintBytes(_ v: Int) -> [UInt8] {
+    var v = v, out: [UInt8] = []
+    repeat { var b = UInt8(v & 0x7f); v >>= 7; if v > 0 { b |= 0x80 }; out.append(b) } while v > 0
+    return out
+}
+
+func blockBytes(_ key: [UInt8], _ value: [UInt8]) -> [UInt8] {
+    varintBytes(0) + varintBytes(key.count) + varintBytes(value.count) + key + value + [0, 0, 0, 0, 1, 0, 0, 0]
+}
+
+func writeTable(_ path: String, _ json: String, compress: Bool) {
+    let data = blockBytes(Array("_https://claude.ai.ochre.test".utf8), [0x01] + Array(json.utf8))
+    var body = data
+    if compress {
+        body = varintBytes(data.count)
+        var i = 0
+        while i < data.count {
+            let n = min(60, data.count - i)
+            body.append(UInt8((n - 1) << 2)); body += data[i..<i + n]; i += n
+        }
+    }
+    var f = body + [compress ? 1 : 0, 0, 0, 0, 0]
+    let indexOffset = f.count
+    let index = blockBytes(Array("z".utf8), varintBytes(0) + varintBytes(body.count))
+    f += index + [0, 0, 0, 0, 0]
+    var footer = varintBytes(indexOffset) + varintBytes(0) + varintBytes(indexOffset) + varintBytes(index.count)
+    footer += [UInt8](repeating: 0, count: 40 - footer.count)
+    f += footer + (0..<8).map { UInt8((LevelDB.tableMagic >> (8 * UInt64($0))) & 0xff) }
+    try! Data(f).write(to: URL(fileURLWithPath: path))
+}
+
+func append(_ path: String, _ data: Data) {
+    if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(data); try? h.close() }
+    else { try! data.write(to: URL(fileURLWithPath: path)) }
+}
+
+func fakeDesktop() -> (root: String, db: String) {
+    let root = NSTemporaryDirectory() + "cl-desktop-" + UUID().uuidString + "/Claude"
+    let db = root + "/Local Storage/leveldb"
+    try! FileManager.default.createDirectory(atPath: db, withIntermediateDirectories: true)
+    try! "MANIFEST-000001\n".write(toFile: db + "/CURRENT", atomically: true, encoding: .utf8)
+    return (root, db)
+}
+
+func v8str(_ s: String) -> [UInt8] { [0x22, UInt8(s.utf8.count)] + Array(s.utf8) }
+func v8num(_ d: Double) -> [UInt8] { [0x4e] + (0..<8).map { UInt8((d.bitPattern >> (8 * UInt64($0))) & 0xff) } }
+func v8window(_ util: Double, _ reset: Double, status: String = "within_limit") -> [UInt8] {
+    [0x6f] + v8str("status") + v8str(status) + v8str("resets_at") + v8num(reset)
+        + v8str("utilization") + v8num(util) + v8str("surpassed_threshold") + [0x30, 0x7b, 0x04]
+}
+/// Кэш ответа claude.ai в IndexedDB: обёртка Chromium (ff 11 02) + Snappy + V8.
+func idbBlob(five: (Double, Double)?, week: (Double, Double)?, updatedMs: Double) -> Data {
+    var windows: [UInt8] = [0x6f]
+    if let f = five { windows += v8str("5h") + v8window(f.0, f.1) }
+    if let w = week { windows += v8str("7d") + v8window(w.0, w.1) }
+    windows += [0x7b, 0x02]
+    let v8: [UInt8] = [0xff, 0x15, 0x6f] + v8str("messageLimits") + [0x6f] + v8str("type") + v8str("within_limit")
+        + v8str("windows") + windows + [0x7b, 0x02, 0x7b, 0x01] + [0x22, 0x0d] + Array("dataUpdatedAt".utf8) + v8num(updatedMs)
+    var out: [UInt8] = [0xff, 0x11, 0x02] + varintBytes(v8.count)
+    var i = 0
+    while i < v8.count { let n = min(60, v8.count - i); out.append(UInt8((n - 1) << 2)); out += v8[i..<i + n]; i += n }
+    return Data(out)
+}
+
+func near(_ a: Double?, _ b: Double) -> Bool { a.map { abs($0 - b) < 1e-9 } ?? false }
+
 @main
 enum UnitTests {
     static func main() {
@@ -46,7 +123,8 @@ enum UnitTests {
         test("L10n: тексты на обоих языках") {
             let ru = L10n(ru: true), en = L10n(ru: false)
             eq(ru.left(42), "осталось 42%"); eq(en.left(42), "42% left")
-            eq(ru.lowTitle(20), "Claude: осталось 20%"); eq(en.lowTitle(20), "Claude: 20% left")
+            eq(ru.lowTitle(.code, 20), "[Claude Code] Осталось 20%"); eq(en.lowTitle(.desktop, 20), "[Claude Desktop] 20% left")
+            eq(ru.resetTitle(.desktop), "[Claude Desktop] Лимит сброшен")
             check(ru.lowBody(five: true, used: 80, countdown: "через 1 ч 0 мин").contains("5-часовое окно израсходовано на 80%"), "lowBody ru five")
             check(en.lowBody(five: false, used: 95, countdown: "in 2d 1h").contains("Weekly limit is 95% used"), "lowBody en week")
             check(ru.resetBody(five: false).contains("Недельный"), "resetBody ru week")
@@ -168,6 +246,216 @@ enum UnitTests {
             eq(f?.rate_limits.five_hour?.used_percentage, 23.5)
             check(f?.rate_limits.seven_day == nil, "недельного окна нет — это нормально")
             check((try? JSONDecoder().decode(LimitsFile.self, from: Data("{}".utf8))) == nil, "битый файл не разбирается")
+        }
+
+        test("Updater: сравнение версий") {
+            check(Updater.isNewer("2.1.0", than: "2.0.0"), "2.1.0 > 2.0.0")
+            check(Updater.isNewer("2.0.10", than: "2.0.9"), "числа, а не строки")
+            check(Updater.isNewer("v3", than: "2.9.9"), "префикс v и короткая версия")
+            check(Updater.isNewer("2.0.0\n", than: "1.0"), "перевод строки в файле")
+            check(!Updater.isNewer("2.0.0", than: "2.0.0"), "та же версия — не обновление")
+            check(!Updater.isNewer("1.9.0", than: "2.0.0"), "старая версия на сервере — не откатываемся")
+            check(!Updater.isNewer("", than: "2.0.0"), "пустой файл")
+            check(!Updater.isNewer("<html>404</html>", than: "0.0.0"), "страница ошибки вместо версии")
+            check(Updater.isNewer("2.0.0", than: "0.0.0"), "версия не была известна")
+            eq(Updater.components("2.10.1-beta"), [2, 10, 1])
+        }
+
+        // MARK: Парсеры (Strategy) и Claude Desktop
+        test("Snappy: литералы и копирование с перекрытием, битый поток") {
+            eq(try? LevelDB.snappy([0x0C, 0x0C, 0x61, 0x62, 0x63, 0x64, 0x11, 0x04]), Array("abcdabcdabcd".utf8))
+            eq(try? LevelDB.snappy([6, 0x00, 0x78, 0x12, 0x01, 0x00]), Array("xxxxxx".utf8))
+            check((try? LevelDB.snappy([0x0C, 0x11, 0x04])) == nil, "битый поток -> ошибка")
+        }
+
+        test("ClaudeDesktopParser: не установлен / пустая база / пути") {
+            let p = ClaudeDesktopParser(customPath: NSTemporaryDirectory() + "cl-none-" + UUID().uuidString)
+            eq(p.getLogPath(), ""); check(!p.isInstalled(), "не установлен")
+            eq(p.parseLimits(now: now).status, .notFound); check(p.getResetTime() == nil, "нет времени сброса")
+            let f = fakeDesktop()
+            let q = ClaudeDesktopParser(customPath: f.root)
+            check(q.isInstalled(), "установлен"); eq(q.getLogPath(), f.db)
+            eq(ClaudeDesktopParser(customPath: f.db).getLogPath(), f.db, "путь прямо на leveldb:")
+            eq(q.parseLimits(now: now).status, .noData)
+        }
+
+        test("ClaudeDesktopParser: журнал — свежая запись, проценты, время сброса") {
+            let f = fakeDesktop(), log = f.db + "/000003.log"
+            append(log, journalEntry(desktopRecord(0.35, now + 600, now - 7200)))
+            append(log, journalEntry(desktopRecord(0.18, now + 3 * 3600, now - 60)))
+            append(log, journalEntry(desktopRecord(0.9, now + 3 * 3600, now - 3600)))
+            let p = ClaudeDesktopParser(customPath: f.root)
+            let m = p.parseLimits(now: now)
+            eq(m.status, .ok); eq(m.source, .desktop); eq(m.logPath, f.db); eq(m.windows.count, 1)
+            let w = m.windows[0]
+            check(w.rolling && w.id == "five_hour", "скользящее 5-часовое окно")
+            check(near(w.used, 18) && near(w.left, 82), "самая свежая по observedAt: \(w.used)")
+            eq(w.resetsAt, now + 3 * 3600); eq(m.updated, now - 60)
+            eq(p.parseLimits(now: now + 3 * 3600 + 1).windows[0].used, 0, "после сброса — 0%:")
+        }
+
+        test("ClaudeDesktopParser: offset, обрыв записи, atWall, мусор, пересоздание журнала") {
+            let f = fakeDesktop(), log = f.db + "/000005.log"
+            append(log, journalEntry(desktopRecord(0.2, now + 3600, now - 300)))
+            let p = ClaudeDesktopParser(customPath: f.root)
+            check(near(p.parseLimits(now: now).windows.first?.used, 20), "первое чтение")
+            let offset = p.journals[log]?.offset ?? 0
+            eq(offset, (try! FileManager.default.attributesOfItem(atPath: log)[.size] as! NSNumber).uint64Value, "offset = размер:")
+            let rec = Data(desktopRecord(0.55, now + 3600, now - 100).utf8)
+            append(log, rec.prefix(40))
+            check(near(p.parseLimits(now: now).windows.first?.used, 20), "недописанная запись не ломает результат")
+            append(log, rec.dropFirst(40))
+            check(near(p.parseLimits(now: now).windows.first?.used, 55), "запись собрана из хвоста")
+            check((p.journals[log]?.offset ?? 0) > offset, "offset сдвинулся")
+            append(log, Data(#"{"resetsAt":"x","utilization":}{"resetsAt":1,"observedAt":2}{{{"#.utf8) + Data([0xff]))
+            append(log, journalEntry(desktopRecord(0.97, now + 1800, now - 10, atWall: true)))
+            let w = p.parseLimits(now: now).windows.first
+            check(w?.used == 100 && w?.left == 0 && w?.resetsAt == now + 1800, "atWall = исчерпано")
+            try! Data([1, 2, 3]).write(to: URL(fileURLWithPath: log))
+            eq(p.parseLimits(now: now).status, .noData, "журнал пересоздан:")
+        }
+
+        test("ClaudeDesktopParser: таблицы .ldb (Snappy и без сжатия), кэш, компакция") {
+            let f = fakeDesktop()
+            writeTable(f.db + "/000010.ldb", desktopRecord(0.31, now + 7200, now - 900), compress: true)
+            check((try? LevelDB.tableText(f.db + "/000010.ldb"))?.contains("\"utilization\":0.31") == true, "Snappy-блок распакован")
+            let p = ClaudeDesktopParser(customPath: f.root)
+            check(near(p.parseLimits(now: now).windows.first?.used, 31), "запись из сжатой таблицы")
+            check(p.tables[f.db + "/000010.ldb"] != nil, "таблица закэширована")
+            writeTable(f.db + "/000011.ldb", desktopRecord(0.6, now + 7200, now - 100), compress: false)
+            try! Data((0..<200).map { UInt8($0) }).write(to: URL(fileURLWithPath: f.db + "/000012.ldb"))
+            append(f.db + "/000013.log", journalEntry(desktopRecord(0.05, now + 7200, now - 5000)))
+            check(near(p.parseLimits(now: now).windows.first?.used, 60), "свежая запись из несжатой таблицы, битая пропущена")
+            try! FileManager.default.removeItem(atPath: f.db + "/000011.ldb")
+            _ = p.parseLimits(now: now)
+            check(p.tables[f.db + "/000011.ldb"] == nil, "удалённая таблица убрана из кэша")
+        }
+
+        test("ClaudeDesktopParser: IndexedDB — недельный лимит и свежее 5-часовое окно") {
+            let f = fakeDesktop()
+            let blobDir = (f.root as NSString).appendingPathComponent("IndexedDB/https_claude.ai_0.indexeddb.blob/1/00")
+            try! FileManager.default.createDirectory(atPath: blobDir, withIntermediateDirectories: true)
+            try! idbBlob(five: (0.42, now + 3 * 3600), week: (0.08, now + 5 * 86400), updatedMs: (now - 30) * 1000)
+                .write(to: URL(fileURLWithPath: blobDir + "/1d"))
+            append(f.db + "/000003.log", journalEntry(desktopRecord(0.3, now + 3 * 3600, now - 600)))
+            let p = ClaudeDesktopParser(customPath: f.root)
+            var m = p.parseLimits(now: now)
+            eq(m.status, .ok); eq(m.windows.map(\.id), ["five_hour", "seven_day"])
+            check(near(m.window("five_hour")?.used, 42), "5ч из IndexedDB, он свежее Local Storage")
+            check(near(m.window("seven_day")?.used, 8) && near(m.window("seven_day")?.left, 92), "неделя: осталось 92%")
+            eq(m.window("seven_day")?.rolling, false); eq(m.window("seven_day")?.resetsAt, now + 5 * 86400)
+            eq(m.updated, now - 30)
+            append(f.db + "/000003.log", journalEntry(desktopRecord(0.5, now + 3 * 3600, now - 5)))
+            m = p.parseLimits(now: now)
+            check(near(m.window("five_hour")?.used, 50), "свежая запись Local Storage перекрывает кэш")
+            check(near(m.window("seven_day")?.used, 8), "неделя остаётся из кэша")
+            eq(m.samples.map { $0.f ?? -1 }.map { $0.rounded() }, [30, 50], "прошлые замеры окна для графика:")
+            let url = URL(fileURLWithPath: NSTemporaryDirectory() + "cl-seed-" + UUID().uuidString + ".jsonl")
+            History.append(m, to: url)
+            eq(History.load(url).map { ($0.f ?? -1).rounded() }, [30, 50, 50], "история засеяна замерами + текущий снимок с неделей:")
+            eq(History.load(url).last?.w, 8, "последняя строка несёт недельное значение:")
+            History.append(m, to: url)
+            eq(History.load(url).count, 3, "повторный снимок не дублирует историю:")
+            try! Data([0xff, 0x11, 0x02, 0x05, 0x01]).write(to: URL(fileURLWithPath: blobDir + "/20"))
+            eq(p.parseLimits(now: now).windows.count, 2, "битый blob пропущен:")
+            let only = ClaudeDesktopParser.findWindows(Array(idbBlob(five: nil, week: (1.0, now + 100), updatedMs: 0).dropFirst(0)), fallbackTime: 7)
+            check(only.isEmpty, "сжатые данные без распаковки не разбираются")
+        }
+
+        test("History: история Claude Desktop пишется только при изменении процентов") {
+            let url = URL(fileURLWithPath: NSTemporaryDirectory() + "cl-hist-" + UUID().uuidString + ".jsonl")
+            var m = LimitMetrics(source: .desktop, status: .ok, updated: now)
+            m.windows = [LimitWindow(id: "five_hour", raw: 42, resetsAt: now + 3600, rolling: true, now: now),
+                         LimitWindow(id: "seven_day", raw: 8, resetsAt: now + 86400, rolling: false, now: now)]
+            History.append(m, to: url); History.append(m, to: url)
+            eq(History.load(url).count, 1, "без изменений — одна строка:")
+            m.windows[0] = LimitWindow(id: "five_hour", raw: 45, resetsAt: now + 3600, rolling: true, now: now)
+            m.updated = now + 60
+            History.append(m, to: url)
+            let h = History.load(url)
+            eq(h.count, 2); eq(h.last?.f, 45); eq(h.last?.w, 8); eq(h.last?.t, now + 60)
+            History.append(LimitMetrics(source: .desktop, status: .notFound), to: url)
+            eq(History.load(url).count, 2, "без данных не пишем:")
+            let pts = chartPoints(kind: .week, state: m.windows[1].state, history: h, now: nowDate)
+            eq(pts.first?.used, 0, "график недели начинается с 0%:")
+            let dup = [Sample(t: now - 60, f: 42, fr: nil, w: nil, wr: nil), Sample(t: now - 60, f: 42, fr: nil, w: 8, wr: nil)]
+            eq(chartPoints(kind: .fiveHour, state: m.windows[0].state, history: dup, now: nowDate).count, 3,
+               "точки с одинаковым временем не дублируются (иначе заливка складывается):")
+        }
+
+        test("ClaudeCodeParser: обёртка над limits.json") {
+            let dir = NSTemporaryDirectory() + "cl-code-" + UUID().uuidString
+            try! FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let path = dir + "/limits.json"
+            let p = ClaudeCodeParser(path: path)
+            eq(p.parseLimits(now: now).status, .noData)
+            eq(ClaudeCodeParser(path: dir + "/no/limits.json").parseLimits(now: now).status, .notFound)
+            try! #"{"updated_at":1800000000,"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1800003600},"seven_day":{"used_percentage":90,"resets_at":1799999990}}}"#
+                .write(toFile: path, atomically: true, encoding: .utf8)
+            let m = p.parseLimits(now: now)
+            eq(m.status, .ok); eq(m.updated, now)
+            eq(m.window("five_hour")?.left, 76.5); eq(m.window("five_hour")?.rolling, false)
+            eq(m.window("seven_day")?.used, 0, "сброшенное окно:"); eq(m.window("seven_day")?.raw, 90)
+            try! "{broken".write(toFile: path, atomically: true, encoding: .utf8)
+            eq(p.parseLimits(now: now).status, .invalid, "битый файл:")
+            for s in LimitSource.allCases { eq(newLimitParser(s).source, s, "единый контракт:") }
+        }
+
+        test("Уведомления: источник в заголовке, Desktop — порог 100% и свой ключ") {
+            let ru = L10n(ru: true), en = L10n(ru: false)
+            let code = LimitWindow(id: "five_hour", raw: 81, resetsAt: now + 3600, rolling: false, now: now)
+            let t = notificationText(.low(threshold: 80, used: 81), source: .code, window: code, l: ru, now: nowDate)
+            eq(t.title, "[Claude Code] Осталось 19%"); eq(t.body, "5-часовое окно израсходовано на 81%. Сброс через 1 ч 0 мин.")
+            eq(notifyKey(.code, code), "five_hour", "ключ Code не изменился:")
+            let desk = LimitWindow(id: "five_hour", raw: 100, resetsAt: now + 5400, rolling: true, now: now)
+            eq(notifyKey(.desktop, desk), "desktop:five_hour")
+            var n: [String: Double] = [:]
+            let ev = NotifyRules.decide(kind: notifyKey(.desktop, desk), window: Window(used_percentage: 100, resets_at: desk.resetsAt),
+                                        notified: &n, now: now, thresholds: notifyThresholds(desk))
+            eq(ev, .low(threshold: 100, used: 100))
+            eq(Set(n.keys), ["desktop:five_hour:100", "desktop:five_hour:95", "desktop:five_hour:80"])
+            let at = ru.clock(Date(timeIntervalSince1970: now + 5400))
+            let d = notificationText(ev!, source: .desktop, window: desk, l: ru, now: nowDate)
+            eq(d.title, "[Claude Desktop] Осталось 0%"); eq(d.body, "5-часовое окно сообщений исчерпано. Сброс в \(at).")
+            eq(notificationText(.low(threshold: 80, used: 84), source: .desktop, window: desk, l: en).body,
+               "5-hour message window is 84% used. Resets at \(at).")
+            eq(ru.usedResetAt(18, Date(timeIntervalSince1970: now + 7800), now: nowDate),
+               "Использовано 18% · сброс в \(ru.clock(Date(timeIntervalSince1970: now + 7800))) (через 2 ч 10 мин)")
+        }
+
+        test("LimitMonitoringService: фоновые очереди, подписка, debounce, смена папки") {
+            let dir = NSTemporaryDirectory() + "cl-mon-" + UUID().uuidString
+            try! FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let code = dir + "/limits.json"
+            func write(_ u: Double) {
+                let t = Date().timeIntervalSince1970
+                try! "{\"updated_at\":\(t),\"rate_limits\":{\"five_hour\":{\"used_percentage\":\(u),\"resets_at\":\(t + 3600)}}}"
+                    .write(toFile: code, atomically: true, encoding: .utf8)
+            }
+            write(10)
+            let f = fakeDesktop()
+            let t = Date().timeIntervalSince1970
+            append(f.db + "/000003.log", journalEntry(desktopRecord(0.25, t + 3600, t)))
+            let svc = LimitMonitoringService()
+            svc.interval = 1.5; svc.debounce = 0.2
+            var got = 0
+            svc.subscribe(.code) { _ in got += 1 }
+            svc.watch(.code, path: code)
+            svc.watch(.desktop, path: f.root)
+            check(svc.waitForAll(timeout: 10), "первые снимки получены")
+            eq(svc.latest[.code]?.window("five_hour")?.used, 10)
+            check(near(svc.latest[.desktop]?.window("five_hour")?.used, 25), "Desktop 25%")
+            eq(got, 1, "подписчик вызван один раз:")
+            for u in [30.0, 40, 64] { write(u); Thread.sleep(forTimeInterval: 0.05) }
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline, svc.latest[.code]?.window("five_hour")?.used != 64 { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+            eq(svc.latest[.code]?.window("five_hour")?.used, 64, "изменение доставлено:")
+            check(got <= 3, "debounce: серия записей не даёт событие на каждую (\(got))")
+            svc.watch(.desktop, path: dir + "/missing")
+            check(svc.waitForAll(timeout: 10), "смена папки")
+            eq(svc.latest[.desktop]?.status, .notFound)
+            svc.close()
+            eq(svc.activeWorkers, 0, "все очереди остановлены:")
         }
 
         // MARK: Итог

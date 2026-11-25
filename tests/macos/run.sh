@@ -6,7 +6,7 @@ BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
 
 echo "### macOS: юнит-тесты"
-xcrun swiftc -parse-as-library -o "$BUILD/unit" "$REPO/macos/Core.swift" "$REPO/tests/macos/UnitTests.swift" || exit 1
+xcrun swiftc -parse-as-library -o "$BUILD/unit" "$REPO/macos/Core.swift" "$REPO/macos/Parsers.swift" "$REPO/macos/Monitoring.swift" "$REPO/tests/macos/UnitTests.swift" || exit 1
 "$BUILD/unit"; unit=$?
 
 echo ""

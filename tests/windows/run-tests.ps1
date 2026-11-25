@@ -4,7 +4,7 @@
 #
 # Части:
 #   1. Файлы: кодировка UTF-8 с BOM (нужна Windows PowerShell 5.1 для кириллицы), синтаксис, полнота переводов
-#   2. Юнит-тесты логики (ClaudeLimits.Core.ps1)
+#   2. Юнит-тесты логики (Core), парсеров Claude Code / Claude Desktop (поддельные LevelDB-логи) и фонового опроса
 #   3. statusline.ps1 как отдельный процесс (так его запускает Claude Code)
 #   4. Только Windows: настоящая установка в изолированные папки, команда из settings.json через cmd и Git Bash,
 #      установка «одной командой» со скачиванием, самопроверка значка в трее (WinForms + график), удаление
@@ -16,6 +16,8 @@ $OnWindows = $env:OS -eq 'Windows_NT'
 $PsExe = (Get-Process -Id $PID).Path
 
 . (Join-Path $WinDir 'ClaudeLimits.Core.ps1')
+. (Join-Path $WinDir 'ClaudeLimits.Parsers.ps1')
+. (Join-Path $WinDir 'ClaudeLimits.Monitoring.ps1')
 
 $script:Pass = 0
 $script:Fail = New-Object System.Collections.ArrayList
@@ -116,34 +118,65 @@ Test 'Read-Config / Save-Config' {
     Eq (Read-Config $p).language 'system' 'битый файл = настройки по умолчанию:'
     Write-Utf8 $p '{"language":"fr"}'
     Eq (Read-Config $p).language 'system' 'неизвестный язык игнорируется:'
+    $c = Read-Config $p
+    Eq $c.active_tab 0 'вкладка по умолчанию:'; Eq $c.desktop_path '' 'папка Desktop по умолчанию:'
+    $c.active_tab = 1; $c.desktop_path = 'D:\Claude'
+    Save-Config $c $p
+    $c2 = Read-Config $p
+    Eq $c2.active_tab 1 'вкладка сохраняется:'; Eq $c2.desktop_path 'D:\Claude' 'папка Desktop сохраняется:'
+    Write-Utf8 $p '{"active_tab":7,"desktop_path":5}'
+    $c3 = Read-Config $p
+    Ok ($c3.active_tab -eq 0 -and $c3.desktop_path -eq '') 'мусорные active_tab / desktop_path игнорируются'
     Remove-Item -Recurse -Force $d
 }
 
-Test 'Read-Limits' {
+Test 'ClaudeCodeParser (limits.json)' {
     $d = New-TempDir
     $p = Join-Path $d 'limits.json'
-    Ok ($null -eq (Read-Limits $p $Now)) 'нет файла -> $null'
+    $parser = [ClaudeCodeParser]::new($p)
+    Eq $parser.GetLogPath() $p 'GetLogPath:'
+    Ok (-not $parser.IsInstalled()) 'нет файла -> IsInstalled = false'
+    Eq $parser.ParseAt($Now).Status 'NoData' 'нет файла:'
+    Eq ([ClaudeCodeParser]::new((Join-Path $d 'нет/limits.json'))).ParseAt($Now).Status 'NotFound' 'нет папки:'
     Write-Utf8 $p ('{"updated_at":' + $Now + ',"model":"Opus","rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":' + ($Now + 3600) + '},"seven_day":{"used_percentage":90,"resets_at":' + ($Now - 10) + '}}}')
-    $l = Read-Limits $p $Now
-    Eq $l.Five.Used 23.5; Eq $l.Five.Left 76.5; Eq $l.Five.Reset ($Now + 3600)
-    Eq $l.Week.Used 0 'сброшенное окно = 0%:'; Eq $l.Week.RawUsed 90 'RawUsed сохраняется:'
-    Eq $l.Updated $Now
+    $m = $parser.ParseAt($Now)
+    Eq $m.Status 'Ok'; Eq $m.Source 'code'; Eq $m.Updated $Now
+    $five = Get-MetricsWindow $m 'five_hour'; $week = Get-MetricsWindow $m 'seven_day'
+    Eq $five.Used 23.5; Eq $five.Left 76.5; Eq $five.Reset ($Now + 3600); Ok (-not $five.Rolling) 'окно Code не скользящее'
+    Eq $week.Used 0 'сброшенное окно = 0%:'; Eq $week.RawUsed 90 'RawUsed сохраняется:'
     Write-Utf8 $p '{"updated_at":1,"rate_limits":{"seven_day":{"used_percentage":5,"resets_at":9999999999}}}'
-    $l = Read-Limits $p $Now
-    Ok ($null -eq $l.Five -and $l.Week.Used -eq 5) 'только недельное окно'
+    $m = $parser.ParseAt($Now)
+    Ok ($null -eq (Get-MetricsWindow $m 'five_hour') -and (Get-MetricsWindow $m 'seven_day').Used -eq 5) 'только недельное окно'
+    Ok ($parser.GetResetTime() -is [datetime]) 'GetResetTime -> DateTime'
     Write-Utf8 $p 'не json'
-    Ok ($null -eq (Read-Limits $p $Now)) 'битый файл -> $null'
+    Eq $parser.ParseAt($Now).Status 'NoData' 'битый файл:'
     Remove-Item -Recurse -Force $d
 }
 
-Test 'Get-TrayTooltip: не длиннее 63 символов' {
-    $l = @{ Five = @{ Left = 86.4 }; Week = @{ Left = 49 } }
-    Eq (Get-TrayTooltip $l $ru) 'Claude · 5ч: 86% · неделя: 49%'
-    Eq (Get-TrayTooltip $l $en) 'Claude · 5h: 86% · week: 49%'
+Test 'Get-TrayTooltip: оба источника, не длиннее 63 символов' {
+    $code = @{ Source = 'code'; Status = 'Ok'; Windows = @(@{ Id = 'five_hour'; Left = 86.4 }, @{ Id = 'seven_day'; Left = 49 }) }
+    $desk = @{ Source = 'desktop'; Status = 'Ok'; Windows = @(@{ Id = 'five_hour'; Left = 82; Rolling = $true }) }
+    Eq (Get-TrayTooltip @($code, $null) $ru) 'Code: 5ч 86% · неделя 49%'
+    Eq (Get-TrayTooltip @($code, $desk) $en) 'Code: 5h 86% · week 49% | Desktop: 5h 82%'
+    Eq (Get-TrayTooltip @($null, @{ Source = 'desktop'; Status = 'NotFound' }) $ru) $ru.TipNoData 'без данных:'
     foreach ($T in @($ru, $en)) {
-        Ok ((Get-TrayTooltip $null $T).Length -le 63) 'без данных <= 63'
-        Ok ((Get-TrayTooltip @{ Five = @{ Left = 100 }; Week = @{ Left = 100 } } $T).Length -le 63) 'с данными <= 63'
+        Ok ((Get-TrayTooltip @() $T).Length -le 63) 'без данных <= 63'
+        Ok ((Get-TrayTooltip @($code, $desk) $T).Length -le 63) 'с данными <= 63'
     }
+}
+
+Test 'Карточки: окна Code и скользящее окно Desktop, пустые состояния' {
+    $l = Format-WindowLines @{ Id = 'five_hour'; Used = 14; Left = 86; Reset = ($Now + 3600) } $ru $Now
+    Eq $l[0] '5 часов: осталось 86%  (использовано 14%)'
+    Eq $l[1] '      сброс через 1 ч 0 мин'
+    $reset = $Now + 2 * 3600 + 600
+    $l = Format-WindowLines @{ Id = 'five_hour'; Used = 18; Left = 82; Reset = $reset; Rolling = $true } $en $Now
+    Eq $l[0] '5-hour window (rolling): 82% left  (18% used)'
+    Eq $l[1] ('      resets at {0} (in 2h 10m)' -f (ConvertTo-LocalTime $reset).ToString('HH:mm'))
+    Eq (Get-EmptyStateLines 'desktop' $null $ru)[0] $ru.Loading 'ещё нет снимка:'
+    Eq (Get-EmptyStateLines 'desktop' @{ Status = 'NotFound' } $ru)[0] 'Claude Desktop: не подключено'
+    Eq (Get-EmptyStateLines 'desktop' @{ Status = 'NoData' } $en)[1] 'Send a message in Claude Desktop.'
+    Eq (Get-EmptyStateLines 'code' @{ Status = 'NoData' } $ru)[0] $ru.NoDataLong 'Code без данных — как раньше:'
 }
 
 Test 'Get-NotifyEvent: пороги 80/95, один раз за окно' {
@@ -177,17 +210,40 @@ Test 'Get-NotifyEvent: сброс окна' {
     Ok ($null -eq (Get-NotifyEvent 'five_hour' @{ RawUsed = 90; Reset = ($Now - 3600) } $n2 $Now)) 'час назад — устарело'
 }
 
-Test 'Format-Notification' {
-    $w = @{ RawUsed = 81; Reset = ($Now + 3600) }
-    $m = Format-Notification @{ Type = 'low'; Threshold = 80; Used = 81 } $w $true $ru $Now
-    Eq $m.Title 'Claude: осталось 19%'
+Test 'Get-NotifyEvent: скользящее окно Desktop — порог 100% и отдельный ключ' {
+    $n = @{}
+    $w = @{ Id = 'five_hour'; RawUsed = 100; Reset = ($Now + 3600); Rolling = $true }
+    Eq (Get-NotifyKey 'desktop' $w) 'desktop:five_hour'
+    Eq (Get-NotifyKey 'code' $w) 'five_hour' 'ключ Code не изменился (совместимость с config.json):'
+    $e = Get-NotifyEvent (Get-NotifyKey 'desktop' $w) $w $n $Now (Get-NotifyThresholds $w)
+    Ok ($e.Threshold -eq 100) 'исчерпано -> порог 100'
+    Ok ($n.ContainsKey('desktop:five_hour:80') -and $n.ContainsKey('desktop:five_hour:95')) 'нижние пороги помечены'
+    Ok (-not $n.ContainsKey('five_hour:80')) 'Code не затронут'
+}
+
+Test 'Format-Notification: источник в заголовке' {
+    $w = @{ Id = 'five_hour'; RawUsed = 81; Reset = ($Now + 3600) }
+    $m = Format-Notification @{ Type = 'low'; Threshold = 80; Used = 81 } $w 'code' $ru $Now
+    Eq $m.Title '[Claude Code] Осталось 19%'
     Eq $m.Body '5-часовое окно израсходовано на 81%. Сброс через 1 ч 0 мин.'
     Eq $m.Icon 'Info'
-    $m = Format-Notification @{ Type = 'low'; Threshold = 95; Used = 97 } $w $false $en $Now
-    Eq $m.Title 'Claude: 3% left'; Eq $m.Icon 'Warning'
+    $ww = @{ Id = 'seven_day'; RawUsed = 97; Reset = ($Now + 3600) }
+    $m = Format-Notification @{ Type = 'low'; Threshold = 95; Used = 97 } $ww 'code' $en $Now
+    Eq $m.Title '[Claude Code] 3% left'; Eq $m.Icon 'Warning'
     Ok ($m.Body -like 'Weekly limit is 97% used*') 'тело на английском'
-    $m = Format-Notification @{ Type = 'reset' } $w $false $ru $Now
-    Eq $m.Title 'Лимит Claude сброшен'; Ok ($m.Body -like 'Недельный*') 'сброс недели'
+    $m = Format-Notification @{ Type = 'reset' } $ww 'code' $ru $Now
+    Eq $m.Title '[Claude Code] Лимит сброшен'; Ok ($m.Body -like 'Недельный*') 'сброс недели'
+
+    $reset = $Now + 5400
+    $at = (ConvertTo-LocalTime $reset).ToString('HH:mm')
+    $wd = @{ Id = 'five_hour'; RawUsed = 100; Reset = $reset; Rolling = $true }
+    $m = Format-Notification @{ Type = 'low'; Threshold = 100; Used = 100 } $wd 'desktop' $ru $Now
+    Eq $m.Title '[Claude Desktop] Осталось 0%'
+    Eq $m.Body "5-часовое окно сообщений исчерпано. Сброс в $at."
+    $m = Format-Notification @{ Type = 'low'; Threshold = 80; Used = 84 } $wd 'desktop' $en $Now
+    Eq $m.Body "5-hour message window is 84% used. Resets at $at."
+    $m = Format-Notification @{ Type = 'reset' } $wd 'desktop' $ru $Now
+    Eq $m.Title '[Claude Desktop] Лимит сброшен'
 }
 
 Test 'Read-History' {
@@ -205,26 +261,53 @@ Test 'Read-History' {
 
 Test 'Get-ChartModel: точки и прогноз' {
     $start = $Now - 4 * 3600
-    $limits = @{ Five = @{ Used = 40.0; Reset = ($Now + 3600) }; Week = @{ Used = 9.0; Reset = ($Now + 86400) } }
+    $five = @{ Id = 'five_hour'; Used = 40.0; Reset = ($Now + 3600) }
+    $week = @{ Id = 'seven_day'; Used = 9.0; Reset = ($Now + 86400) }
     $hist = @(
         [pscustomobject]@{ t = ($start - 100); f = 99 },
         [pscustomobject]@{ t = ($start + 600); f = 10; w = 5 },
         [pscustomobject]@{ t = ($start + 7200); f = 25 },
         [pscustomobject]@{ t = ($Now + 100); f = 77 }
     )
-    $m = Get-ChartModel $limits $hist $true $Now
+    $m = Get-ChartModel $five $hist $Now
     Eq (($m.Points | ForEach-Object { $_[1] }) -join ',') '0,10,25,40' 'точки 5ч:'
     Eq $m.Start $start; Eq $m.End ($Now + 3600)
     Ok ($null -eq $m.RunOut) '40% за 4ч, остался 1ч — хватит'
-    $mw = Get-ChartModel $limits $hist $false $Now
+    $mw = Get-ChartModel $week $hist $Now
     Eq (($mw.Points | ForEach-Object { $_[1] }) -join ',') '0,5,9' 'точки недели:'
 
     # 60% за 2 часа -> 100% через 80 минут, до сброса 3 часа
-    $l2 = @{ Five = @{ Used = 60.0; Reset = ($Now + 3 * 3600) } }
-    $m2 = Get-ChartModel $l2 @() $true $Now
+    $m2 = Get-ChartModel @{ Id = 'five_hour'; Used = 60.0; Reset = ($Now + 3 * 3600) } @() $Now
     Ok ([math]::Abs($m2.RunOut - ($Now + 4800)) -le 1) "прогноз через 80 мин (получено $($m2.RunOut - $Now) с)"
-    Ok ($null -eq (Get-ChartModel @{ Five = @{ Used = 10; Reset = ($Now - 1) } } @() $true $Now)) 'окно сброшено -> нет графика'
-    Ok ($null -eq (Get-ChartModel $null @() $true $Now)) 'нет данных -> нет графика'
+    Ok ($null -eq (Get-ChartModel @{ Id = 'five_hour'; Used = 10; Reset = ($Now - 1) } @() $Now)) 'окно сброшено -> нет графика'
+    Ok ($null -eq (Get-ChartModel $null @() $Now)) 'нет данных -> нет графика'
+}
+
+Test 'Обновления: сравнение версий, VERSION по URL, команда обновления' {
+    Ok (Test-NewerVersion '2.1.0' '2.0.0') '2.1.0 > 2.0.0'
+    Ok (Test-NewerVersion '2.0.10' '2.0.9') 'числа, а не строки'
+    Ok (Test-NewerVersion 'v3' '2.9.9') 'префикс v'
+    Ok (Test-NewerVersion "2.0.0`n" '0.0.0') 'перевод строки, версия не была известна'
+    Ok (-not (Test-NewerVersion '2.0.0' '2.0.0')) 'та же версия'
+    Ok (-not (Test-NewerVersion '1.9.0' '2.0.0')) 'старая версия на сервере — не откатываемся'
+    Ok (-not (Test-NewerVersion '' '2.0.0')) 'пустой файл'
+    Ok (-not (Test-NewerVersion '<html>404</html>' '0.0.0')) 'страница ошибки'
+    Eq ((Get-VersionParts '2.10.1-beta') -join '.') '2.10.1'
+    $d = New-TempDir
+    Eq (Get-InstalledVersion $d) '0.0.0' 'нет файла:'
+    Write-Utf8 (Join-Path $d 'VERSION') "2.0.0`n"
+    Eq (Get-InstalledVersion $d) '2.0.0'
+    Eq (Get-RemoteVersion ([Uri](Join-Path $d 'VERSION')).AbsoluteUri) '2.0.0' 'VERSION по file://:'
+    $failed = $false
+    try { [void](Get-RemoteVersion ([Uri](Join-Path $d 'нет')).AbsoluteUri) } catch { $failed = $true }
+    Ok $failed 'недоступный адрес -> ошибка, а не обновление'
+    $a = Get-UpdateArguments 'https://example.test/repo'
+    Ok ($a -like '*https://example.test/repo/windows/install.ps1*' -and $a -like '*-ExecutionPolicy Bypass*') "команда обновления: $a"
+    $tokens = $null; $errors = $null
+    $inner = ($a -replace '^.*-Command "', '' -replace '"$', '') -replace '\\"', '"'
+    [void][System.Management.Automation.Language.Parser]::ParseInput($inner, [ref]$tokens, [ref]$errors)
+    Eq $errors.Count 0 "команда обновления без синтаксических ошибок ($inner):"
+    Remove-Item -Recurse -Force $d
 }
 
 Test 'settings.json: прописать и убрать statusLine' {
@@ -262,6 +345,288 @@ Test 'settings.json: прописать и убрать statusLine' {
     Write-Utf8 $p '{"statusLine":{"type":"command","command":"~/mine.sh"}}'
     Ok (-not (Remove-ClaudeStatusLine $p)) 'чужой statusLine не трогаем'
     Remove-Item -Recurse -Force $d
+}
+
+# ============================================================ 2б. Claude Desktop (поддельные LevelDB-логи)
+Write-Host '== ClaudeDesktopParser'
+
+$Latin1 = [Text.Encoding]::GetEncoding(28591)
+function New-DesktopRecord([double]$Util, [int64]$Reset, [double]$Observed, [bool]$AtWall = $false) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    '{{"resetsAt":{0},"utilization":{1},"prevUtilization":0.1,"observedAt":{2},"atWall":{3},"fired":[],"shown":false}}' -f $Reset, $Util.ToString($inv), $Observed.ToString($inv), $AtWall.ToString().ToLower()
+}
+function New-FakeDesktop {
+    $root = New-TempDir
+    $db = [IO.Path]::Combine($root, 'Local Storage', 'leveldb')
+    New-Item -ItemType Directory -Force -Path $db | Out-Null
+    [IO.File]::WriteAllText((Join-Path $db 'CURRENT'), "MANIFEST-000001`n")
+    return @{ Root = $root; Db = $db }
+}
+function Add-JournalRecord([string]$Path, [string]$Json) {
+    [byte[]]$bytes = [byte[]](0x9a, 0x01, 0x00, 0x00, 0x01) + $Latin1.GetBytes('_https://claude.ai') + [byte[]](0x00, 0x01) + $Latin1.GetBytes('ochre.test') + [byte[]](0x8f, 0x01) + $Latin1.GetBytes($Json) + [byte[]](0x00, 0x7b, 0xff)
+    $fs = [IO.File]::Open($Path, 'Append', 'Write', 'ReadWrite')
+    try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
+}
+function ConvertTo-Varint([int64]$v) {
+    $out = New-Object System.Collections.Generic.List[byte]
+    do { $b = [byte]($v -band 0x7f); $v = $v -shr 7; if ($v -gt 0) { $b = $b -bor 0x80 }; $out.Add($b) } while ($v -gt 0)
+    return , $out.ToArray()
+}
+function New-BlockBytes([byte[]]$Key, [byte[]]$Value) {
+    $b = New-Object System.Collections.Generic.List[byte]
+    $b.AddRange((ConvertTo-Varint 0)); $b.AddRange((ConvertTo-Varint $Key.Length)); $b.AddRange((ConvertTo-Varint $Value.Length))
+    $b.AddRange($Key); $b.AddRange($Value)
+    $b.AddRange([BitConverter]::GetBytes([int32]0)); $b.AddRange([BitConverter]::GetBytes([int32]1))
+    return , $b.ToArray()
+}
+# Snappy: литерал до 60 байт, затем копирование всего литерала со смещением = его длине
+function ConvertTo-SnappyRepeat([byte[]]$Chunk, [int]$Times) {
+    $b = New-Object System.Collections.Generic.List[byte]
+    $b.AddRange((ConvertTo-Varint ($Chunk.Length * $Times)))
+    $b.Add([byte](($Chunk.Length - 1) -shl 2)); $b.AddRange($Chunk)
+    for ($i = 1; $i -lt $Times; $i++) { $b.Add([byte]((($Chunk.Length - 1) -shl 2) -bor 2)); $b.Add([byte]$Chunk.Length); $b.Add(0) }
+    return , $b.ToArray()
+}
+# SSTable: один блок данных (сжатый Snappy или нет), индекс, footer с magic
+function New-FakeTable([string]$Path, [string]$Json, [bool]$Compress) {
+    $data = New-BlockBytes $Latin1.GetBytes('_https://claude.ai.ochre.test') ([byte[]](0x01) + $Latin1.GetBytes($Json))
+    if ($Compress) {
+        $s = New-Object System.Collections.Generic.List[byte]
+        $s.AddRange((ConvertTo-Varint $data.Length))
+        $i = 0
+        while ($i -lt $data.Length) {
+            $n = [math]::Min(60, $data.Length - $i)
+            $s.Add([byte](($n - 1) -shl 2)); $s.AddRange([byte[]]$data[$i..($i + $n - 1)])
+            $i += $n
+        }
+        $block = $s.ToArray(); $type = 1
+    } else { $block = $data; $type = 0 }
+    $file = New-Object System.Collections.Generic.List[byte]
+    $file.AddRange([byte[]]$block); $file.Add([byte]$type); $file.AddRange([byte[]](0, 0, 0, 0))
+    $handle = [byte[]]((ConvertTo-Varint 0) + (ConvertTo-Varint $block.Length))
+    $indexOffset = $file.Count
+    $index = New-BlockBytes $Latin1.GetBytes('z') $handle
+    $file.AddRange($index); $file.Add(0); $file.AddRange([byte[]](0, 0, 0, 0))
+    $footer = New-Object System.Collections.Generic.List[byte]
+    $footer.AddRange((ConvertTo-Varint $indexOffset)); $footer.AddRange((ConvertTo-Varint 0))
+    $footer.AddRange((ConvertTo-Varint $indexOffset)); $footer.AddRange((ConvertTo-Varint ($index.Length)))
+    while ($footer.Count -lt 40) { $footer.Add(0) }
+    $footer.AddRange([byte[]](0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb))
+    $file.AddRange($footer)
+    [IO.File]::WriteAllBytes($Path, $file.ToArray())
+}
+
+Test 'Snappy: литералы и копирование с перекрытием' {
+    $ldb = 'ClaudeLimits.LevelDb' -as [type]
+    $out = $ldb::Snappy([byte[]](0x0C, 0x0C, 0x61, 0x62, 0x63, 0x64, 0x11, 0x04))
+    Eq $Latin1.GetString($out) 'abcdabcdabcd'
+    Eq $Latin1.GetString($ldb::Snappy((ConvertTo-SnappyRepeat $Latin1.GetBytes('xyz') 4))) 'xyzxyzxyzxyz' 'копирование 2-байтовым смещением:'
+    $bad = $false
+    try { [void]$ldb::Snappy([byte[]](0x0C, 0x11, 0x04)) } catch { $bad = $true }
+    Ok $bad 'битый поток -> исключение, а не мусор'
+}
+
+Test 'ClaudeDesktopParser: не установлен / пустая база' {
+    $missing = Join-Path ([IO.Path]::GetTempPath()) ('cl-none-' + [guid]::NewGuid().ToString('N'))
+    $p = [ClaudeDesktopParser]::new($missing)
+    Eq $p.GetLogPath() '' 'GetLogPath:'
+    Ok (-not $p.IsInstalled()) 'IsInstalled = false'
+    Eq $p.ParseAt($Now).Status 'NotFound'
+    Ok ($null -eq $p.GetResetTime()) 'GetResetTime = $null'
+    $f = New-FakeDesktop
+    $p = [ClaudeDesktopParser]::new($f.Root)
+    Ok $p.IsInstalled() 'есть Local Storage/leveldb -> установлен'
+    Eq $p.GetLogPath() $f.Db 'путь к leveldb из корня Claude:'
+    Eq ([ClaudeDesktopParser]::new($f.Db)).GetLogPath() $f.Db 'путь прямо на папку leveldb:'
+    Eq $p.ParseAt($Now).Status 'NoData' 'база без записи о лимитах:'
+    Remove-Item -Recurse -Force $f.Root
+}
+
+Test 'ClaudeDesktopParser: журнал .log — проценты, время сброса, самая свежая запись' {
+    $f = New-FakeDesktop
+    $log = Join-Path $f.Db '000003.log'
+    Add-JournalRecord $log (New-DesktopRecord 0.35 ($Now + 600) ($Now - 7200))
+    Add-JournalRecord $log (New-DesktopRecord 0.18 ($Now + 3 * 3600) ($Now - 60))
+    Add-JournalRecord $log (New-DesktopRecord 0.9 ($Now + 3 * 3600) ($Now - 3600))
+    $p = [ClaudeDesktopParser]::new($f.Root)
+    $m = $p.ParseAt($Now)
+    Eq $m.Status 'Ok'; Eq $m.Source 'desktop'; Eq $m.LogPath $f.Db
+    Eq $m.Windows.Count 1 'одно окно:'
+    $w = $m.Windows[0]
+    Eq $w.Id 'five_hour'; Ok $w.Rolling 'окно скользящее'
+    Ok ([math]::Abs($w.Used - 18) -lt 1e-9) "по observedAt выбрана самая свежая запись (получено $($w.Used))"
+    Ok ([math]::Abs($w.Left - 82) -lt 1e-9) 'осталось 82%'
+    Eq $w.Reset ($Now + 3 * 3600) 'время сброса:'
+    Eq $m.Updated ($Now - 60) 'Updated = observedAt:'
+    Eq $p.ParseAt($Now + 3 * 3600 + 1).Windows[0].Used 0 'после resetsAt окно обнулено:'
+    Remove-Item -Recurse -Force $f.Root
+}
+
+Test 'ClaudeDesktopParser: дочитывание с offset, обрыв записи, atWall, мусор' {
+    $f = New-FakeDesktop
+    $log = Join-Path $f.Db '000005.log'
+    Add-JournalRecord $log (New-DesktopRecord 0.2 ($Now + 3600) ($Now - 300))
+    $p = [ClaudeDesktopParser]::new($f.Root)
+    Ok ([math]::Abs($p.ParseAt($Now).Windows[0].Used - 20) -lt 1e-9) 'первое чтение'
+    $key = (Get-Item -LiteralPath $log).FullName
+    $offset = $p.Journals[$key].Offset
+    Eq $offset (Get-Item $log).Length 'offset = размер файла:'
+
+    $rec = New-DesktopRecord 0.55 ($Now + 3600) ($Now - 100)
+    $half = [int]($rec.Length / 2)
+    $fs = [IO.File]::Open($log, 'Append', 'Write', 'ReadWrite')
+    try { $b = $Latin1.GetBytes($rec.Substring(0, $half)); $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
+    Ok ([math]::Abs($p.ParseAt($Now).Windows[0].Used - 20) -lt 1e-9) 'недописанная запись не ломает результат'
+    $fs = [IO.File]::Open($log, 'Append', 'Write', 'ReadWrite')
+    try { $b = $Latin1.GetBytes($rec.Substring($half)); $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
+    Ok ([math]::Abs($p.ParseAt($Now).Windows[0].Used - 55) -lt 1e-9) 'дописанная запись собрана из хвоста'
+    Ok ($p.Journals[$key].Offset -gt $offset) 'offset сдвинулся, файл не перечитывается с нуля'
+
+    Add-JournalRecord $log '{"resetsAt":"сломано","utilization":}{"resetsAt":1,"observedAt":2}{{{'
+    Add-JournalRecord $log (New-DesktopRecord 0.97 ($Now + 1800) ($Now - 10) $true)
+    $w = $p.ParseAt($Now).Windows[0]
+    Ok ($w.Used -eq 100 -and $w.Left -eq 0) "atWall = окно исчерпано (получено $($w.Used))"
+    Eq $w.Reset ($Now + 1800)
+
+    [IO.File]::WriteAllBytes($log, [byte[]](1, 2, 3))
+    Eq $p.ParseAt($Now).Status 'NoData' 'журнал пересоздан (стал короче) -> читается заново:'
+    Remove-Item -Recurse -Force $f.Root
+}
+
+Test 'ClaudeDesktopParser: чтение при открытом на запись журнале (FileShare.ReadWrite)' {
+    $f = New-FakeDesktop
+    $log = Join-Path $f.Db '000007.log'
+    $writer = New-Object IO.FileStream($log, 'Create', 'Write', 'ReadWrite')
+    try {
+        $b = $Latin1.GetBytes((New-DesktopRecord 0.42 ($Now + 3600) ($Now - 5)))
+        $writer.Write($b, 0, $b.Length); $writer.Flush()
+        $m = ([ClaudeDesktopParser]::new($f.Root)).ParseAt($Now)
+        Ok ($m.Status -eq 'Ok' -and [math]::Abs($m.Windows[0].Used - 42) -lt 1e-9) "прочитано, пока файл открыт Claude Desktop ($($m.Status))"
+    } finally { $writer.Dispose() }
+    Remove-Item -Recurse -Force $f.Root
+}
+
+Test 'ClaudeDesktopParser: таблицы .ldb (Snappy и без сжатия), кэш, битые файлы' {
+    $f = New-FakeDesktop
+    New-FakeTable (Join-Path $f.Db '000010.ldb') (New-DesktopRecord 0.31 ($Now + 7200) ($Now - 900)) $true
+    $ldb = 'ClaudeLimits.LevelDb' -as [type]
+    Ok ($ldb::ReadTableText((Join-Path $f.Db '000010.ldb')) -like '*"utilization":0.31*') 'блок Snappy распакован'
+    $p = [ClaudeDesktopParser]::new($f.Root)
+    $m = $p.ParseAt($Now)
+    Ok ($m.Status -eq 'Ok' -and [math]::Abs($m.Windows[0].Used - 31) -lt 1e-9) "запись из сжатой таблицы ($($m.Status))"
+    Ok $p.Tables.ContainsKey((Get-Item -LiteralPath (Join-Path $f.Db '000010.ldb')).FullName) 'таблица закэширована'
+
+    New-FakeTable (Join-Path $f.Db '000011.ldb') (New-DesktopRecord 0.6 ($Now + 7200) ($Now - 100)) $false
+    [IO.File]::WriteAllBytes((Join-Path $f.Db '000012.ldb'), [byte[]](1..200))
+    $m = $p.ParseAt($Now)
+    Ok ([math]::Abs($m.Windows[0].Used - 60) -lt 1e-9) 'свежая запись из несжатой таблицы, битая таблица пропущена'
+
+    Add-JournalRecord (Join-Path $f.Db '000013.log') (New-DesktopRecord 0.05 ($Now + 7200) ($Now - 5000))
+    Ok ([math]::Abs($p.ParseAt($Now).Windows[0].Used - 60) -lt 1e-9) 'старая запись в журнале не перекрывает свежую из таблицы'
+
+    $gone = (Get-Item -LiteralPath (Join-Path $f.Db '000011.ldb')).FullName
+    Remove-Item -LiteralPath $gone
+    [void]$p.ParseAt($Now)
+    Ok (-not $p.Tables.ContainsKey($gone)) 'удалённая (после компакции) таблица убрана из кэша'
+    Remove-Item -Recurse -Force $f.Root
+}
+
+function ConvertTo-V8String([string]$Text) { [byte[]](@(0x22, $Text.Length) + [byte[]]$Latin1.GetBytes($Text)) }
+function ConvertTo-V8Number([double]$X) { [byte[]](@(0x4e) + [BitConverter]::GetBytes($X)) }
+function New-V8Window([double]$Util, [double]$Reset) {
+    [byte[]](@(0x6f) + (ConvertTo-V8String 'status') + (ConvertTo-V8String 'within_limit') + (ConvertTo-V8String 'resets_at') + (ConvertTo-V8Number $Reset) +
+        (ConvertTo-V8String 'utilization') + (ConvertTo-V8Number $Util) + (ConvertTo-V8String 'surpassed_threshold') + @(0x30, 0x7b, 0x04))
+}
+# Кэш ответа claude.ai в IndexedDB: обёртка Chromium (ff 11 02) + Snappy (литералы) + V8
+function New-IdbBlob([string]$Path, [double[]]$Five, [double[]]$Week, [double]$UpdatedMs) {
+    $win = [byte[]]@(0x6f)
+    if ($Five) { $win += (ConvertTo-V8String '5h') + (New-V8Window $Five[0] $Five[1]) }
+    if ($Week) { $win += (ConvertTo-V8String '7d') + (New-V8Window $Week[0] $Week[1]) }
+    $win += [byte[]](0x7b, 0x02)
+    $v8 = [byte[]](@(0xff, 0x15, 0x6f) + (ConvertTo-V8String 'messageLimits') + @(0x6f) + (ConvertTo-V8String 'windows') + $win +
+        @(0x7b, 0x01, 0x7b, 0x01) + @(0x22, 0x0d) + [byte[]]$Latin1.GetBytes('dataUpdatedAt') + (ConvertTo-V8Number $UpdatedMs))
+    $out = New-Object System.Collections.Generic.List[byte]
+    $out.AddRange([byte[]](0xff, 0x11, 0x02)); $out.AddRange((ConvertTo-Varint $v8.Length))
+    for ($i = 0; $i -lt $v8.Length; $i += 60) {
+        $n = [math]::Min(60, $v8.Length - $i)
+        $out.Add([byte](($n - 1) -shl 2)); $out.AddRange([byte[]]$v8[$i..($i + $n - 1)])
+    }
+    $dir = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    [IO.File]::WriteAllBytes($Path, $out.ToArray())
+}
+
+Test 'ClaudeDesktopParser: IndexedDB — недельный лимит, свежее 5-часовое окно, история' {
+    $f = New-FakeDesktop
+    New-IdbBlob ([IO.Path]::Combine($f.Root, 'IndexedDB', 'https_claude.ai_0.indexeddb.blob', '1', '00', '1d')) @(0.42, ($Now + 3 * 3600)) @(0.08, ($Now + 5 * 86400)) (($Now - 30) * 1000)
+    Add-JournalRecord (Join-Path $f.Db '000003.log') (New-DesktopRecord 0.3 ($Now + 3 * 3600) ($Now - 600))
+    $p = [ClaudeDesktopParser]::new($f.Root)
+    $m = $p.ParseAt($Now)
+    Eq $m.Status 'Ok'
+    Eq (($m.Windows | ForEach-Object { $_.Id }) -join ',') 'five_hour,seven_day' 'окна:'
+    Ok ([math]::Abs((Get-MetricsWindow $m 'five_hour').Used - 42) -lt 1e-9) '5ч из IndexedDB (свежее Local Storage)'
+    $week = Get-MetricsWindow $m 'seven_day'
+    Ok ([math]::Abs($week.Used - 8) -lt 1e-9 -and [math]::Abs($week.Left - 92) -lt 1e-9 -and -not $week.Rolling) "неделя: осталось 92% ($($week.Left))"
+    Eq $week.Reset ($Now + 5 * 86400) 'сброс недели:'
+    Eq $m.Updated ($Now - 30) 'Updated = dataUpdatedAt:'
+    Add-JournalRecord (Join-Path $f.Db '000003.log') (New-DesktopRecord 0.5 ($Now + 3 * 3600) ($Now - 5))
+    $m = $p.ParseAt($Now)
+    Ok ([math]::Abs((Get-MetricsWindow $m 'five_hour').Used - 50) -lt 1e-9) 'свежая запись Local Storage перекрывает кэш'
+    Eq (($m.Samples | ForEach-Object { [math]::Round($_.f) }) -join ',') '30,50' 'прошлые замеры окна:'
+
+    $hist = Join-Path $f.Root 'desktop-history.jsonl'
+    Ok (Add-MetricsHistory $m $hist $Now) 'история записана'
+    Eq ((Read-History $hist | ForEach-Object { '{0}/{1}' -f $_.f, $_.w }) -join ',') '30/,50/,50/8' 'замеры + текущий снимок с неделей:'
+    Ok (-not (Add-MetricsHistory $m $hist $Now)) 'без изменений — не дописываем'
+    $model = Get-ChartModel (Get-MetricsWindow $m 'five_hour') (Read-History $hist) $Now
+    Eq (($model.Points | ForEach-Object { $_[1] }) -join ',') '0,30,50,50' 'точки с одинаковым временем не дублируются:'
+    Remove-Item -Recurse -Force $f.Root
+}
+
+Test 'New-LimitParser: единый контракт для обоих источников' {
+    foreach ($s in $Sources) {
+        $p = New-LimitParser $s (Join-Path ([IO.Path]::GetTempPath()) 'cl-nothing')
+        Ok ($p -is [LimitParser]) "$s реализует LimitParser"
+        Eq $p.Source $s
+        foreach ($method in 'ParseLimits', 'GetResetTime', 'IsInstalled', 'GetLogPath') { Ok ($null -ne $p.GetType().GetMethod($method)) "$s.$method" }
+    }
+}
+
+# ============================================================ 2в. Фоновый опрос
+Write-Host '== LimitMonitoringService'
+
+Test 'LimitMonitoringService: runspace, подписка, обновление по изменению файла' {
+    $d = New-TempDir
+    $code = Join-Path $d 'limits.json'
+    $json = { param($u) '{"updated_at":' + (Get-UnixNow) + ',"rate_limits":{"five_hour":{"used_percentage":' + $u + ',"resets_at":' + ((Get-UnixNow) + 3600) + '}}}' }
+    Write-Utf8 $code (& $json 10)
+    $desk = New-FakeDesktop
+    Add-JournalRecord (Join-Path $desk.Db '000003.log') (New-DesktopRecord 0.25 ((Get-UnixNow) + 3600) (Get-UnixNow))
+
+    $svc = [LimitMonitoringService]::new((Join-Path $WinDir 'ClaudeLimits.Parsers.ps1'))
+    $svc.IntervalMs = 1500; $svc.DebounceMs = 200
+    $got = [Collections.ArrayList]::new()
+    $svc.Subscribe('code', { param($m) [void]$got.Add($m) }.GetNewClosure())
+    try {
+        $svc.Watch('code', $code)
+        $svc.Watch('desktop', $desk.Root)
+        Ok ($svc.WaitForAll(30000)) "первые снимки получены (code: $($svc.Fault('code')); desktop: $($svc.Fault('desktop')))"
+        Eq (Get-MetricsWindow $svc.Latest['code'] 'five_hour').Used 10 'Code:'
+        Ok ([math]::Abs((Get-MetricsWindow $svc.Latest['desktop'] 'five_hour').Used - 25) -lt 1e-9) 'Desktop: 25%'
+        Eq $got.Count 1 'подписчик Code вызван один раз:'
+
+        Write-Utf8 $code (& $json 64)
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        while ([DateTime]::UtcNow -lt $deadline -and (Get-MetricsWindow $svc.Latest['code'] 'five_hour').Used -ne 64) { [void]$svc.Dispatch(); Start-Sleep -Milliseconds 100 }
+        Eq (Get-MetricsWindow $svc.Latest['code'] 'five_hour').Used 64 'изменение файла доставлено:'
+        Ok ($got.Count -ge 2) 'подписчик получил обновление'
+
+        $svc.Watch('desktop', (Join-Path $d 'нет-такой-папки'))
+        Ok ($svc.WaitForAll(15000)) 'смена папки Desktop'
+        Eq $svc.Latest['desktop'].Status 'NotFound' 'неверная папка -> NotFound:'
+    } finally { $svc.Dispose() }
+    Ok ($svc.Retired.Count -eq 0 -and $svc.Workers.Count -eq 0) 'все runspace освобождены'
+    Remove-Item -Recurse -Force $d, $desk.Root -ErrorAction SilentlyContinue
 }
 
 # ============================================================ 3. statusline.ps1
@@ -338,9 +703,13 @@ if ($OnWindows) {
             Write-Utf8 $settings '{"model":"opus","statusLine":{"type":"command","command":"~/old.sh"}}'
             $out = & $PsExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $WinDir 'install.ps1') 2>&1
             Eq $LASTEXITCODE 0 "код выхода ($($out -join ' | ')):"
-            foreach ($f in @('ClaudeLimits.Core.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'uninstall.ps1')) {
+            foreach ($f in @('ClaudeLimits.Core.ps1', 'ClaudeLimits.Parsers.ps1', 'ClaudeLimits.Monitoring.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'uninstall.ps1')) {
                 Ok (Test-Path (Join-Path $inst $f)) "установлен $f"
             }
+            $cfg = Read-Config (Join-Path $inst 'config.json')
+            Ok ((Test-Path (Join-Path $inst 'config.json')) -and $cfg.active_tab -eq 0 -and $cfg.desktop_path -eq '') 'config.json с настройками по умолчанию'
+            Ok (($out -join ' ') -like '*Claude Desktop*') 'установщик сообщает о Claude Desktop'
+            Eq (Get-InstalledVersion $inst) ([IO.File]::ReadAllText((Join-Path $Repo 'VERSION')).Trim()) 'версия записана:'
             $j = [IO.File]::ReadAllText($settings) | ConvertFrom-Json
             Eq $j.statusLine.command (Get-StatusLineCommand $inst) 'statusLine:'
             Eq $j.model 'opus' 'остальные настройки:'

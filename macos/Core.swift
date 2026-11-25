@@ -1,4 +1,5 @@
 // ClaudeLimits — логика без интерфейса: statusline, установка, история, прогноз, правила уведомлений, тексты.
+// Источники данных — в Parsers.swift, фоновый опрос — в Monitoring.swift.
 // Покрыта тестами: tests/macos/UnitTests.swift и tests/macos/integration.sh
 
 import Foundation
@@ -103,6 +104,9 @@ enum Installer {
         backup()
         guard writeSettings(withStatusLine(s, command: command)) else { return false }
         print("statusLine прописан в \(settingsURL.path)")
+        let desktop = ClaudeDesktopParser(customPath: UserDefaults.standard.string(forKey: "desktopPath"))
+        print(desktop.isInstalled() ? "Claude Desktop: \(desktop.getLogPath())"
+                                    : "Claude Desktop не найден: вкладка покажет «Не подключено», папку можно выбрать в окне приложения.")
         return true
     }
 
@@ -114,6 +118,38 @@ enum Installer {
             print("statusLine удалён из \(settingsURL.path)")
         }
         return true
+    }
+}
+
+// MARK: - Обновления (VERSION на GitHub, установка — тем же install.sh)
+
+enum Updater {
+    static var repoRaw: String {
+        ProcessInfo.processInfo.environment["CLAUDE_LIMITS_REPO_RAW"]
+            ?? "https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main"
+    }
+    static var versionURL: URL { URL(string: repoRaw + "/VERSION")! }
+    static var installerURL: URL { URL(string: repoRaw + "/macos/install.sh")! }
+
+    static var installedVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+    }
+
+    /// "v2.10.1" -> [2, 10, 1]; всё, что не число, отбрасывается.
+    static func components(_ v: String) -> [Int] {
+        let s = v.trimmingCharacters(in: .whitespacesAndNewlines).drop { $0 == "v" || $0 == "V" }
+        return s.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+    }
+
+    /// Новее ли remote, чем local. Пустая или нечисловая версия на сервере — не обновление.
+    static func isNewer(_ remote: String, than local: String) -> Bool {
+        let r = components(remote), l = components(local)
+        guard !r.isEmpty, r.contains(where: { $0 > 0 }) else { return false }
+        for i in 0..<max(r.count, l.count) {
+            let a = i < r.count ? r[i] : 0, b = i < l.count ? l[i] : 0
+            if a != b { return a > b }
+        }
+        return false
     }
 }
 
@@ -145,8 +181,10 @@ struct WindowState {
 // Одна строка на изменение: {"t":<epoch>,"f":<5h %>,"fr":<5h reset>,"w":<7d %>,"wr":<7d reset>}
 
 let historyURL = claudeDir.appendingPathComponent("limits-history.jsonl")
+/// История вкладки Claude Desktop: её пишет само приложение при каждом новом снимке.
+let desktopHistoryURL = claudeDir.appendingPathComponent("limits-desktop-history.jsonl")
 
-struct Sample: Decodable {
+struct Sample: Decodable, Equatable {
     let t: Double
     let f: Double?
     let fr: Double?
@@ -189,17 +227,42 @@ enum History {
         guard var line = try? JSONSerialization.data(withJSONObject: s) else { return }
         line.append(0x0A)
 
-        if let h = try? FileHandle(forWritingTo: historyURL) {
-            h.seekToEndOfFile(); h.write(line); try? h.close()
-        } else {
-            try? line.write(to: historyURL)
-        }
-        pruneIfLarge()
+        write(line, to: historyURL)
     }
 
-    private static func pruneIfLarge() {
-        let size = (try? FileManager.default.attributesOfItem(atPath: historyURL.path)[.size] as? Int) ?? 0
-        guard size > maxBytes, let text = try? String(contentsOf: historyURL, encoding: .utf8) else { return }
+    /// Дописывает снимок источника (например, Claude Desktop), если проценты изменились.
+    static func append(_ m: LimitMetrics, to url: URL, now: Double = Date().timeIntervalSince1970) {
+        guard m.status == .ok else { return }
+        let f = m.window("five_hour"), w = m.window("seven_day")
+        var last = load(url).last
+        for old in m.samples where old.t > (last?.t ?? 0) && old.f != last?.f {
+            guard var line = try? JSONSerialization.data(withJSONObject: ["t": Int(old.t), "f": old.f ?? 0, "fr": old.fr ?? 0]) else { continue }
+            line.append(0x0A)
+            write(line, to: url)
+            last = old
+        }
+        guard last == nil || last?.f != f?.raw || last?.w != w?.raw else { return }
+        var s: [String: Any] = ["t": Int(max(m.updated > 0 ? m.updated : now, last?.t ?? 0))]
+        if let f { s["f"] = f.raw; s["fr"] = f.resetsAt }
+        if let w { s["w"] = w.raw; s["wr"] = w.resetsAt }
+        guard var line = try? JSONSerialization.data(withJSONObject: s) else { return }
+        line.append(0x0A)
+        write(line, to: url)
+    }
+
+    private static func write(_ line: Data, to url: URL) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(line); try? h.close()
+        } else {
+            try? line.write(to: url)
+        }
+        pruneIfLarge(url)
+    }
+
+    private static func pruneIfLarge(_ url: URL) {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        guard size > maxBytes, let text = try? String(contentsOf: url, encoding: .utf8) else { return }
         let cutoff = Date().timeIntervalSince1970 - keepDays * 86400
         let kept = text.split(separator: "\n").filter { line in
             guard let d = line.data(using: .utf8),
@@ -207,11 +270,11 @@ enum History {
                   let t = (o["t"] as? NSNumber)?.doubleValue else { return false }
             return t >= cutoff
         }
-        try? (kept.joined(separator: "\n") + "\n").write(to: historyURL, atomically: true, encoding: .utf8)
+        try? (kept.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
-    static func load() -> [Sample] {
-        guard let text = try? String(contentsOf: historyURL, encoding: .utf8) else { return [] }
+    static func load(_ url: URL = historyURL) -> [Sample] {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
         let dec = JSONDecoder()
         return text.split(separator: "\n").compactMap { try? dec.decode(Sample.self, from: Data($0.utf8)) }
     }
@@ -231,6 +294,7 @@ func chartPoints(kind: WindowKind, state: WindowState, history: [Sample], now: D
     for s in history {
         let t = Date(timeIntervalSince1970: s.t)
         guard t >= start, t <= now, let v = (kind == .fiveHour ? s.f : s.w) else { continue }
+        if pts.last?.date == t { pts.removeLast() }
         pts.append(ChartPoint(date: t, used: v))
     }
     pts.append(ChartPoint(date: now, used: state.used))
@@ -323,7 +387,9 @@ struct L10n {
     var notifOnTitle: String   { ru ? "Уведомления включены" : "Notifications are on" }
     var notifOnBody: String    { ru ? "Сообщу, когда лимит будет заканчиваться и когда он сбросится."
                                     : "I'll let you know when a limit is running low and when it resets." }
-    func lowTitle(_ left: Int) -> String { ru ? "Claude: осталось \(left)%" : "Claude: \(left)% left" }
+    func lowTitle(_ source: LimitSource, _ left: Int) -> String {
+        ru ? "[\(source.title)] Осталось \(left)%" : "[\(source.title)] \(left)% left"
+    }
     func lowBody(five: Bool, used: Int, countdown: String) -> String {
         if ru {
             return five ? "5-часовое окно израсходовано на \(used)%. Сброс \(countdown)."
@@ -332,7 +398,46 @@ struct L10n {
         return five ? "5-hour window is \(used)% used. Resets \(countdown)."
                     : "Weekly limit is \(used)% used. Resets \(countdown)."
     }
-    var resetTitle: String { ru ? "Лимит Claude сброшен" : "Claude limit has reset" }
+    func resetTitle(_ source: LimitSource) -> String {
+        ru ? "[\(source.title)] Лимит сброшен" : "[\(source.title)] Limit has reset"
+    }
+    func lowBodyRolling(used: Int, at: String) -> String {
+        if used >= 100 { return ru ? "5-часовое окно сообщений исчерпано. Сброс в \(at)." : "5-hour message window is used up. Resets at \(at)." }
+        return ru ? "5-часовое окно сообщений израсходовано на \(used)%. Сброс в \(at)."
+                  : "5-hour message window is \(used)% used. Resets at \(at)."
+    }
+    var resetBodyRolling: String { ru ? "5-часовое окно сообщений обновилось — можно работать."
+                                      : "The 5-hour message window has reset — you're good to go." }
+
+    // Обновления
+    var checkUpdates: String     { ru ? "Проверить обновления" : "Check for updates" }
+    var checkingUpdates: String  { ru ? "Проверяю…" : "Checking…" }
+    func upToDate(_ v: String) -> String { ru ? "Последняя версия (\(v))" : "Up to date (\(v))" }
+    func updateTo(_ v: String) -> String { ru ? "Обновить до \(v)" : "Update to \(v)" }
+    var updateFailed: String     { ru ? "Не удалось проверить" : "Couldn't check" }
+    var installingUpdate: String { ru ? "Устанавливаю обновление…" : "Installing update…" }
+
+    // Вкладка Claude Desktop
+    var rolling: String        { ru ? "Окно 5 ч (скользящее)" : "5-hour window (rolling)" }
+    var loading: String        { ru ? "Загрузка…" : "Loading…" }
+    var desktopNotFound: String { ru ? "Claude Desktop: не подключено" : "Claude Desktop: not connected" }
+    var desktopNotFoundHint: String { ru ? "Данные приложения не найдены. Укажите папку вручную."
+                                         : "App data not found. Choose the folder manually." }
+    var desktopNoData: String  { ru ? "Лимиты пока не записаны. Отправьте сообщение в Claude Desktop."
+                                    : "No limits recorded yet. Send a message in Claude Desktop." }
+    var chooseFolder: String   { ru ? "Выбрать папку…" : "Choose folder…" }
+    var autoFolder: String     { ru ? "Авто" : "Auto" }
+    var folderPanelTitle: String { ru ? "Папка данных Claude Desktop (обычно ~/Library/Application Support/Claude)"
+                                      : "Claude Desktop data folder (usually ~/Library/Application Support/Claude)" }
+    func clock(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: d)
+    }
+    func usedResetAt(_ p: Int, _ d: Date, now: Date = Date()) -> String {
+        ru ? "Использовано \(p)% · сброс в \(clock(d)) (\(countdown(to: d, now: now)))"
+           : "Used \(p)% · resets at \(clock(d)) (\(countdown(to: d, now: now)))"
+    }
     func resetBody(five: Bool) -> String {
         if ru { return five ? "5-часовое окно обновилось — можно работать." : "Недельный лимит обновился — можно работать." }
         return five ? "The 5-hour window has reset — you're good to go." : "The weekly limit has reset — you're good to go."
@@ -350,6 +455,26 @@ struct L10n {
 
 // MARK: - Notification rules (чистая логика, без отправки)
 
+/// Ключ в «уже уведомляли»: у Claude Code — как раньше ("five_hour"), у Desktop — с префиксом источника.
+func notifyKey(_ source: LimitSource, _ w: LimitWindow) -> String {
+    source == .code ? w.id : "\(source.rawValue):\(w.id)"
+}
+
+func notifyThresholds(_ w: LimitWindow) -> [Double] { w.rolling ? [100, 95, 80] : NotifyRules.thresholds }
+
+/// Текст уведомления с источником в заголовке.
+func notificationText(_ ev: NotifyEvent, source: LimitSource, window w: LimitWindow, l: L10n, now: Date = Date()) -> (title: String, body: String) {
+    let reset = Date(timeIntervalSince1970: w.resetsAt)
+    switch ev {
+    case .reset:
+        return (l.resetTitle(source), w.rolling ? l.resetBodyRolling : l.resetBody(five: w.id == "five_hour"))
+    case .low(_, let used):
+        let body = w.rolling ? l.lowBodyRolling(used: used, at: l.clock(reset))
+                             : l.lowBody(five: w.id == "five_hour", used: used, countdown: l.countdown(to: reset, now: now))
+        return (l.lowTitle(source, max(0, 100 - used)), body)
+    }
+}
+
 enum NotifyEvent: Equatable {
     case low(threshold: Int, used: Int)   // израсходовано >= threshold%
     case reset                            // окно сбросилось после сильного расхода
@@ -361,7 +486,9 @@ enum NotifyRules {
     static let resetGrace: Double = 900             // сообщать о сбросе не позже 15 мин после него
 
     /// Решает, нужно ли уведомление для окна `kind`. `notified` — что уже отправляли (ключ -> resets_at окна).
-    static func decide(kind: String, window w: Window, notified: inout [String: Double], now: Double) -> NotifyEvent? {
+    static func decide(kind: String, window w: Window, notified: inout [String: Double], now: Double,
+                       thresholds: [Double] = thresholds) -> NotifyEvent? {
+        let thresholds = thresholds.sorted(by: >)
         func already(_ key: String) -> Bool {
             if let r = notified[key] { return abs(r - w.resets_at) < sameWindowTolerance }
             return false

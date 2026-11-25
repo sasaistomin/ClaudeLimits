@@ -11,7 +11,7 @@ set -euo pipefail
 REPO_RAW="${CLAUDE_LIMITS_REPO_RAW:-https://raw.githubusercontent.com/sasaistomin/ClaudeLimits/main}"
 APP="$HOME/Applications/ClaudeLimits.app"
 BIN="$APP/Contents/MacOS/ClaudeLimits"
-SOURCES=(Core.swift App.swift)
+SOURCES=(Core.swift Parsers.swift Monitoring.swift App.swift)
 
 echo "==> ClaudeLimits: установка"
 
@@ -39,6 +39,14 @@ for f in "${SOURCES[@]}"; do
   fi
 done
 
+# Версия (для кнопки «Проверить обновления»): VERSION в корне проекта или на GitHub
+VERSION=""
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../VERSION" ]; then VERSION="$(cat "$SCRIPT_DIR/../VERSION")"
+else VERSION="$(curl -fsSL "$REPO_RAW/VERSION" 2>/dev/null || true)"; fi
+VERSION="$(printf '%s' "$VERSION" | head -1 | tr -cd '0-9.')"
+[ -n "$VERSION" ] || VERSION="0.0.0"
+echo "==> Версия $VERSION"
+
 # 3. Сборка
 echo "==> Собираю (это займёт ~30 секунд)"
 ( cd "$WORK" && xcrun swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
@@ -49,7 +57,7 @@ echo "==> Собираю (это займёт ~30 секунд)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$WORK/ClaudeLimits" "$BIN"
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -59,7 +67,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>io.github.claudelimits</string>
   <key>CFBundleExecutable</key><string>ClaudeLimits</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>

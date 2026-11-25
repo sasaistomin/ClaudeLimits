@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # ClaudeLimits for Linux — значок в трее (GTK3 + AyatanaAppIndicator/AppIndicator, запасной вариант — Gtk.StatusIcon).
+# Вкладки «Claude Code» / «Claude Desktop»; данные приходят от LimitMonitoringService (фоновые потоки).
 # Нужны пакеты: python3-gi, gir1.2-ayatanaappindicator3-0.1 (или аналог), libnotify-bin — их ставит install.sh.
 # CLAUDE_LIMITS_SELFTEST=1 — автотест: собрать интерфейс, прогнать языки и график, выйти.
 import fcntl
@@ -8,10 +9,12 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claude_limits_core as core  # noqa: E402
+from claude_limits_monitor import LimitMonitoringService  # noqa: E402
 
 import gi  # noqa: E402
 gi.require_version('Gtk', '3.0')
@@ -184,7 +187,7 @@ class ChartWindow(Gtk.Window):
         self.refresh_texts()
 
     def model(self):
-        return core.chart_model(self.app.limits, core.read_history(), self.kind)
+        return core.chart_model(self.app.chart_limits(), core.read_history(self.app.history_path()), self.kind)
 
     def refresh_texts(self):
         t = self.app.t
@@ -222,7 +225,6 @@ class App:
     def __init__(self):
         self.cfg = core.read_config()
         self.t = core.STRINGS[core.resolve_lang(self.cfg['language'])]
-        self.limits = None
         self.chart = None
         self.updating = False
         self.indicator = None
@@ -236,9 +238,26 @@ class App:
             self.status_icon = Gtk.StatusIcon()
             self.status_icon.connect('activate', self.popup)
             self.status_icon.connect('popup-menu', self.popup)
+        self.monitor = LimitMonitoringService()
+        for source in core.SOURCES:
+            self.monitor.subscribe(source, self.on_metrics)
+        self.monitor.watch('code')
+        self.monitor.watch('desktop', self.cfg['desktop_path'])
+        self.ticks = 0
         self.build_menu()
         self.update()
-        GLib.timeout_add_seconds(5, self.tick)
+        GLib.timeout_add(1000, self.tick)
+
+    @property
+    def source(self):
+        return core.SOURCES[self.cfg['active_tab']]
+
+    def chart_limits(self, source=None):
+        m = self.monitor.latest.get(source or self.source)
+        return {core.FIVE: m.window(core.FIVE), core.WEEK: m.window(core.WEEK)} if core.ok_metrics(m) else None
+
+    def history_path(self):
+        return core.history_path() if self.source == 'code' else core.desktop_history_path()
 
     # --- меню ---
     def item(self, menu, label='', sensitive=True, cb=None, check=None):
@@ -251,34 +270,47 @@ class App:
         menu.append(it)
         return it
 
+    def radio_group(self, menu, options, selected, cb):
+        group, items = None, {}
+        for key, name in options:
+            ri = Gtk.RadioMenuItem.new_with_label_from_widget(group, name)
+            group = ri
+            ri.set_active(key == selected)
+            ri.connect('toggled', cb, key)
+            menu.append(ri)
+            items[key] = ri
+        return items
+
     def build_menu(self):
         t = self.t
         self.updating = True
         m = Gtk.Menu()
-        self.mi_five = self.item(m, sensitive=False)
-        self.mi_five_reset = self.item(m, sensitive=False)
-        self.mi_week = self.item(m, sensitive=False)
-        self.mi_week_reset = self.item(m, sensitive=False)
+        self.tab_items = self.radio_group(m, [(i, core.SOURCE_NAMES[s]) for i, s in enumerate(core.SOURCES)],
+                                          self.cfg['active_tab'], self.on_tab)
+        m.append(Gtk.SeparatorMenuItem())
+        self.rows = [self.item(m, sensitive=False) for _ in range(4)]
         self.mi_updated = self.item(m, sensitive=False)
         m.append(Gtk.SeparatorMenuItem())
-        self.item(m, t['chart'], cb=self.open_chart)
+        self.mi_chart = self.item(m, t['chart'], cb=self.open_chart)
+        desktop = Gtk.MenuItem(label=t['desktop_folder'])
+        sub = Gtk.Menu()
+        self.mi_desktop_path = self.item(sub, sensitive=False)
+        self.mi_desktop_auto = self.item(sub, t['desktop_auto'], cb=self.desktop_auto, check=not self.cfg['desktop_path'])
+        self.item(sub, t['desktop_pick'], cb=self.desktop_pick)
+        desktop.set_submenu(sub)
+        m.append(desktop)
         self.mi_notif = self.item(m, t['notifications'], cb=self.toggle_notif, check=self.cfg['notifications'])
         self.mi_start = self.item(m, t['startup'], cb=self.toggle_startup, check=core.autostart_enabled())
         lang = Gtk.MenuItem(label=t['language'])
         sub = Gtk.Menu()
-        group = None
-        self.lang_items = {}
-        for code, name in (('system', t['system']), ('ru', 'Русский'), ('en', 'English')):
-            ri = Gtk.RadioMenuItem.new_with_label_from_widget(group, name)
-            group = ri
-            ri.set_active(self.cfg['language'] == code)
-            ri.connect('toggled', self.on_lang, code)
-            sub.append(ri)
-            self.lang_items[code] = ri
+        self.lang_items = self.radio_group(sub, (('system', t['system']), ('ru', 'Русский'), ('en', 'English')),
+                                           self.cfg['language'], self.on_lang)
         lang.set_submenu(sub)
         m.append(lang)
+        self.mi_update = self.item(m, t['check_updates'], cb=self.on_update)
+        self.set_update_state(getattr(self, 'update_state', ('idle', None)))
         m.append(Gtk.SeparatorMenuItem())
-        self.item(m, t['quit'], cb=lambda *a: Gtk.main_quit())
+        self.item(m, t['quit'], cb=self.quit)
         m.show_all()
         self.menu = m
         if self.indicator:
@@ -289,26 +321,31 @@ class App:
         self.menu.popup_at_pointer(None)
 
     # --- данные ---
+    def set_rows(self, lines):
+        for i, mi in enumerate(self.rows):
+            text = lines[i] if i < len(lines) else ''
+            mi.set_label(text)
+            mi.set_visible(bool(text))
+
     def update(self):
-        t = self.t
-        self.limits = core.read_limits()
-        lim = self.limits
-        has = lim and (lim.get(core.FIVE) or lim.get(core.WEEK))
-        for kind, mi, mr, name in ((core.FIVE, self.mi_five, self.mi_five_reset, t['five']),
-                                   (core.WEEK, self.mi_week, self.mi_week_reset, t['week'])):
-            w = lim.get(kind) if lim else None
-            if w:
-                mi.set_label(t['left_used'].format(name, int(round(w['left'])), int(round(w['used']))))
-                mr.set_label('    ' + t['reset'].format(core.format_countdown(w['reset'], t)))
-                mr.show()
-            else:
-                mi.set_label('{0}: {1}'.format(name, t['no_data']))
-                mr.hide()
-        self.mi_updated.set_label(t['updated'].format(core.format_ago(lim['updated'], t)) if has else t['no_data_long'])
-        used = core.worst_used(lim)
+        t, source = self.t, self.source
+        m = self.monitor.latest.get(source)
+        desktop = self.monitor.latest.get('desktop')
+        self.mi_desktop_path.set_label(desktop.log_path if desktop and desktop.log_path else t['desktop_no_path'])
+        if core.ok_metrics(m):
+            lines = []
+            for w in m.windows:
+                lines.extend(core.window_lines(w, t))
+            self.set_rows(lines)
+            self.mi_updated.set_label(t['updated'].format(core.format_ago(m.updated, t)))
+            self.mi_updated.show()
+        else:
+            self.set_rows(core.empty_state_lines(source, m, t))
+            self.mi_updated.hide()
+        used = core.worst_used(m)
         name, path = make_icon(core.level(used) if used is not None else 'none', used)
-        label = core.indicator_label(lim)
-        tip = '{0}: {1}'.format(t['title'], label)
+        label = core.indicator_label(m)
+        tip = core.tray_tooltip([self.monitor.latest.get(s) for s in core.SOURCES], t)
         if self.indicator:
             self.indicator.set_icon_full(name, tip)
             self.indicator.set_label(label, '100%')
@@ -321,11 +358,22 @@ class App:
             self.status_icon.set_tooltip_text(tip)
         if self.chart and self.chart.get_visible():
             self.chart.refresh_texts()
-        self.check_notifications()
+
+    def on_metrics(self, m):
+        if m.source == 'desktop':
+            core.append_metrics_history(m)
+        self.check_notifications(m.source)
+        if m.source == self.source:
+            self.update()
 
     def tick(self):
         try:
-            self.update()
+            self.monitor.dispatch()
+            self.ticks += 1
+            if self.ticks % 5 == 0:
+                self.update()
+                for source in core.SOURCES:
+                    self.check_notifications(source)
         except Exception as e:  # не даём таймеру умереть
             print('update error:', e, file=sys.stderr)
         return True
@@ -349,18 +397,17 @@ class App:
         except Exception:
             return False
 
-    def check_notifications(self):
-        if not self.cfg['notifications'] or not self.limits:
+    def check_notifications(self, source):
+        m = self.monitor.latest.get(source)
+        if not self.cfg['notifications'] or not core.ok_metrics(m):
             return
         changed = False
-        for kind in (core.FIVE, core.WEEK):
-            w = self.limits.get(kind)
-            if not w:
-                continue
-            ev = core.notify_event(kind, w, self.cfg['notified'])
+        for w in m.windows:
+            ev = core.notify_event(core.notify_key(source, w), w, self.cfg['notified'],
+                                   thresholds=core.notify_thresholds(w))
             if ev:
                 changed = True
-                self.notify(*core.format_notification(ev, w, kind == core.FIVE, self.t))
+                self.notify(*core.format_notification(ev, w, source, self.t))
         if changed:
             core.save_config(self.cfg)
 
@@ -371,6 +418,81 @@ class App:
         self.chart.refresh_texts()
         self.chart.show_all()
         self.chart.present()
+
+    def on_tab(self, it, index):
+        if self.updating or not it.get_active():
+            return
+        self.set_tab(index)
+
+    def set_tab(self, index):
+        if self.cfg['active_tab'] != index:
+            self.cfg['active_tab'] = index
+            core.save_config(self.cfg)
+        self.update()
+        if self.chart:
+            self.chart.refresh_texts()
+
+    def set_desktop_path(self, path):
+        self.cfg['desktop_path'] = path
+        core.save_config(self.cfg)
+        self.monitor.watch('desktop', path)
+        GLib.idle_add(self.rebuild)
+
+    def desktop_auto(self, it):
+        if not self.updating and self.cfg['desktop_path']:
+            self.set_desktop_path('')
+        elif not self.updating:
+            self.rebuild()
+
+    def desktop_pick(self, *a):
+        dlg = Gtk.FileChooserDialog(title=self.t['desktop_pick_title'], action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        start = self.cfg['desktop_path'] or os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(core.home(), '.config'))
+        if os.path.isdir(start):
+            dlg.set_current_folder(start)
+        try:
+            if dlg.run() == Gtk.ResponseType.OK and dlg.get_filename():
+                self.set_desktop_path(dlg.get_filename())
+        finally:
+            dlg.destroy()
+
+    # --- обновления ---
+    def set_update_state(self, state):
+        self.update_state = state
+        kind, version = state
+        t = self.t
+        labels = {'idle': t['check_updates'], 'checking': t['checking_updates'],
+                  'current': t['up_to_date'].format(core.installed_version()),
+                  'available': t['update_to'].format(version), 'failed': t['update_failed'],
+                  'installing': t['installing_update']}
+        self.mi_update.set_label(labels[kind])
+        self.mi_update.set_sensitive(kind not in ('checking', 'installing'))
+        return False
+
+    def on_update(self, *a):
+        kind, version = self.update_state
+        if kind == 'available':
+            self.set_update_state(('installing', version))
+            os.makedirs(core.config_dir(), exist_ok=True)
+            log = open(os.path.join(core.config_dir(), 'update.log'), 'w')
+            subprocess.Popen(core.update_command(), stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+            return
+        self.set_update_state(('checking', None))
+
+        def worker():
+            try:
+                remote = core.fetch_remote_version()
+                state = ('available', remote) if core.is_newer(remote, core.installed_version()) else ('current', None)
+            except Exception:
+                state = ('failed', None)
+            GLib.idle_add(self.set_update_state, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def quit(self, *a):
+        self.monitor.close()
+        Gtk.main_quit()
 
     def toggle_notif(self, it):
         if self.updating:
@@ -406,10 +528,23 @@ class App:
 
 def selftest(app):
     out_dir = os.environ.get('CLAUDE_LIMITS_SELFTEST_OUT')
+    if not app.monitor.wait_for_all(30):
+        raise RuntimeError('monitoring timeout')
     for code in ('ru', 'en', 'system'):
         app.cfg['language'] = code
         app.t = core.STRINGS[core.resolve_lang(code)]
         app.rebuild()
+    tabs = []
+    for i in reversed(range(len(core.SOURCES))):
+        app.set_tab(i)
+        tabs.append('{0}: {1}'.format(core.SOURCES[i], app.rows[0].get_label()))
+    app.monitor.watch('desktop', os.path.join(core.home(), 'cl-missing-desktop'))
+    if not app.monitor.wait_for_all(10):
+        raise RuntimeError('monitoring timeout after desktop path change')
+    app.set_tab(1)
+    if app.rows[0].get_label() != app.t['desktop_not_found']:
+        raise RuntimeError('desktop not-found state: ' + app.rows[0].get_label())
+    app.set_tab(0)
     app.open_chart()
     for b in (app.chart.bw, app.chart.b5):
         b.set_active(True)
@@ -417,14 +552,15 @@ def selftest(app):
         Gtk.main_iteration_do(False)
     for kind in (core.FIVE, core.WEEK):
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 520, 240)
-        model = core.chart_model(app.limits, core.read_history(), kind)
+        model = core.chart_model(app.chart_limits(), core.read_history(app.history_path()), kind)
         draw_chart(cairo.Context(surf), 520, 240, model, app.t, hover_x=300)
         if out_dir:
             surf.write_to_png(os.path.join(out_dir, 'chart-{0}.png'.format(kind)))
     app.notify('Claude Limits', 'selftest')
-    print('SELFTEST OK | label: {0} | menu: {1} | indicator: {2} | forecast: {3}'.format(
-        core.indicator_label(app.limits), app.mi_five.get_label(),
+    print('SELFTEST OK | label: {0} | {1} | indicator: {2} | forecast: {3}'.format(
+        core.indicator_label(app.monitor.latest.get('code')), ' | '.join(tabs),
         'AppIndicator' if app.indicator else 'StatusIcon', app.chart.forecast.get_text()))
+    app.monitor.close()
 
 
 def main():

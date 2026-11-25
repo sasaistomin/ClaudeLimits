@@ -30,7 +30,8 @@ mkdir -p "$SB/.claude"
 echo '{"model":"opus","statusLine":{"type":"command","command":"~/old.sh"}}' > "$SETTINGS"
 out=$(bash "$REPO/linux/install.sh" 2>&1); code=$?
 check_eq "$code" 0 "install.sh завершился успешно"
-for f in claude_limits_core.py claude_limits.py statusline.py uninstall.sh; do check "[ -f '$DIR/$f' ]" "установлен $f"; done
+check_eq "$(cat "$DIR/VERSION")" "$(tr -d '[:space:]' < "$REPO/VERSION")" "версия записана"
+for f in claude_limits_core.py claude_limits_parsers.py claude_limits_monitor.py claude_limits.py statusline.py uninstall.sh; do check "[ -f '$DIR/$f' ]" "установлен $f"; done
 check_eq "$(json "$SETTINGS" statusLine.command)" "python3 \"$DIR/statusline.py\"" "statusLine прописан"
 check_eq "$(json "$SETTINGS" model)" "opus" "остальные настройки сохранены"
 check_eq "$(json "$SETTINGS.bak" statusLine.command)" "~/old.sh" "резервная копия"

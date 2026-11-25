@@ -90,11 +90,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubus
 ### Что делает установщик
 
 - Копирует файлы в `%LOCALAPPDATA%\ClaudeLimits`.
+- Проверяет папки данных Claude Code (`%USERPROFILE%\.claude`) и Claude Desktop (`%APPDATA%\Claude`) и создаёт `config.json` с настройками по умолчанию.
 - Прописывает statusline в `%USERPROFILE%\.claude\settings.json`. Старый файл сохраняется как `settings.json.bak`.
 - Добавляет ярлык в «Автозагрузку», чтобы значок запускался вместе с Windows.
 - Запускает значок в трее (справа внизу; если его не видно, нажмите стрелку **^**).
 
 > Совет: чтобы значок всегда был на виду, перетащите его из-под стрелки **^** на панель задач.
+
+### Вкладки «Claude Code» и «Claude Desktop» (macOS, Windows, Linux)
+
+Вверху окна (macOS) или меню значка (Windows, Linux) есть переключатель **[Claude Code] | [Claude Desktop]**. Выбранная вкладка запоминается, и значок показывает её цифры.
+
+- **Claude Code** показывает 5-часовое и недельное окна, как раньше.
+- **Claude Desktop** показывает скользящее 5-часовое окно (сколько осталось и во сколько сброс) и **недельный лимит**, а также график расхода за 5 часов и за неделю с прогнозом, как у Claude Code. Данные берутся из локального хранилища приложения Claude Desktop: 5-часовое окно — из Local Storage, недельное — из кэша ответа claude.ai в IndexedDB. Папки: `~/Library/Application Support/Claude` (macOS), `%APPDATA%\Claude` (Windows), `~/.config/Claude` (Linux). Файлы только читаются, приложение при этом не блокируется.
+- История для графика Desktop хранится в `~/.claude/limits-desktop-history.jsonl`. При первом запуске в неё подтягиваются замеры текущего 5-часового окна, которые Claude Desktop уже сохранил.
+- Если Claude Desktop не установлен или данные не найдены, вкладка показывает «Не подключено». Папку можно указать вручную: кнопка **Выбрать папку…** на вкладке (macOS) или меню **Claude Desktop → Указать папку данных…** (Windows, Linux).
+- Уведомления подписаны источником: «[Claude Code] Осталось 5%», «[Claude Desktop] 5-часовое окно сообщений исчерпано. Сброс в 18:30».
+
+> Цифры на вкладке Desktop обновляются, только пока вы пишете в Claude Desktop. Если работаете в Claude Code, вкладка Code будет свежее.
+>
+> ⚠️ Формат этой записи Claude Desktop не документирован и может измениться с обновлением приложения. Тогда вкладка покажет «Лимиты пока не записаны», а вкладка Claude Code продолжит работать. Подписка у Claude Code и Claude Desktop общая, поэтому цифры 5-часового окна обычно совпадают; вкладка Desktop полезна, когда вы работаете только в приложении.
 
 ---
 
@@ -147,7 +162,8 @@ bash linux/install.sh
    - при наведении мышью видно, сколько было израсходовано в выбранный момент.
 
    Под графиком подпись: «Прогноз: при таком темпе лимит закончится в 16:40» или «…лимита хватит до сброса». История копится с момента установки, поэтому в первые часы график будет почти пустым.
-9. **Выход** — кнопка «Выйти» (macOS) или «Выход» (Windows, Linux) в меню.
+9. **Обновления** — кнопка «Проверить обновления» в окне (macOS) или пункт меню (Windows, Linux). Приложение сравнивает свою версию с файлом [`VERSION`](VERSION) на GitHub. Если там версия новее, кнопка меняется на «Обновить до X.Y.Z»: по нажатию скачивается свежий установщик, он собирает новую версию и перезапускает приложение. Настройки, история и `statusLine` сохраняются. Сами по себе обновления не проверяются и не ставятся, только по кнопке. Журнал обновления: `~/Library/Logs/ClaudeLimits-update.log` (macOS), `~/.config/claude-limits/update.log` (Linux).
+10. **Выход** — кнопка «Выйти» (macOS) или «Выход» (Windows, Linux) в меню.
 
 Чтобы запустить приложение снова после выхода:
 - **macOS:** откройте `~/Applications/ClaudeLimits.app` или найдите «ClaudeLimits» через Spotlight.
@@ -210,18 +226,24 @@ Claude Code получает данные после каждого своего
 ```
 macos/
   Core.swift             логика: statusline, установка, история, прогноз, правила уведомлений, тексты
-  App.swift              интерфейс: меню-бар (SwiftUI), график (Swift Charts), уведомления
+  Parsers.swift          парсеры LimitParser: ClaudeCodeParser (limits.json), ClaudeDesktopParser (LevelDB)
+  Monitoring.swift       LimitMonitoringService: фоновый опрос, debounce, доставка на главный поток
+  App.swift              интерфейс: меню-бар (SwiftUI), вкладки Code / Desktop, график (Swift Charts), уведомления
   install.sh             сборка и установка
   uninstall.sh           удаление
 windows/
-  ClaudeLimits.Core.ps1  логика (то же, что Core.swift)
-  ClaudeLimits.ps1       значок в трее (WinForms), окно с графиком (GDI+)
+  ClaudeLimits.Core.ps1        логика (то же, что Core.swift): тексты, настройки, карточки, уведомления, график
+  ClaudeLimits.Parsers.ps1     парсеры LimitParser: ClaudeCodeParser (limits.json), ClaudeDesktopParser (LevelDB)
+  ClaudeLimits.Monitoring.ps1  LimitMonitoringService: фоновый опрос в runspace, FileSystemWatcher + debounce
+  ClaudeLimits.ps1             значок в трее (WinForms), вкладки Claude Code / Claude Desktop, окно с графиком (GDI+)
   statusline.ps1         statusline-команда для Claude Code
   install.ps1            установка
   uninstall.ps1          удаление
 linux/
-  claude_limits_core.py  логика (то же, что Core.swift), только стандартный Python
-  claude_limits.py       значок на панели (GTK3 + AppIndicator), окно с графиком (cairo)
+  claude_limits_core.py     логика (то же, что Core.swift), только стандартный Python
+  claude_limits_parsers.py  парсеры LimitParser: ClaudeCodeParser, ClaudeDesktopParser (LevelDB)
+  claude_limits_monitor.py  LimitMonitoringService: фоновые потоки, debounce
+  claude_limits.py          значок на панели (GTK3 + AppIndicator), вкладки Code / Desktop, окно с графиком (cairo)
   statusline.py          statusline-команда для Claude Code
   install.sh             установка (ставит нужные пакеты сам)
   uninstall.sh           удаление
@@ -229,9 +251,9 @@ tests/
   smoke.sh               smoke-тест: быстрая проверка главного (≈10 секунд)
   run-all.sh             все тесты, доступные на этом компьютере
   macos/                 юнит-тесты (UnitTests.swift) и интеграционные (integration.sh)
-  linux/                 юнит-тесты (test_core.py) и интеграционные (integration.sh)
+  linux/                 юнит-тесты (test_core.py, test_sources.py) и интеграционные (integration.sh)
   windows/smoke.ps1      smoke-тест Windows
-  windows/run-tests.ps1  тесты Windows-версии (логика, statusline, установка, значок, удаление)
+  windows/run-tests.ps1  тесты Windows-версии (логика, парсеры Code/Desktop, фоновый опрос, statusline, установка, значок, удаление)
 .github/workflows/tests.yml  автопроверка на macOS, Windows (PowerShell 5.1 и 7), Ubuntu и Fedora при каждом push
 ```
 
@@ -256,6 +278,13 @@ bash tests/run-all.sh
 - **Linux:** `bash tests/linux/run.sh`. Юнит-тесты логики и настоящая установка во временную папку: statusline, история, повторная установка, установка со скачиванием, битый `settings.json`, самопроверка значка с отрисовкой графика (если есть дисплей) и удаление. Логика и установка проверяются и на macOS.
 - **Windows:** `powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows\run-tests.ps1`. Проверяются логика, statusline, установка, команда из `settings.json` через cmd и Git Bash, самопроверка значка в трее с отрисовкой графика и удаление.
 - **GitHub Actions** запускает всё это при каждом push на macOS, Windows (PowerShell 5.1 и 7) и Linux; на чистых Ubuntu и Fedora установщик проверяется «с нуля», вместе с установкой пакетов. Результаты на вкладке **Actions** в репозитории.
+
+### Как выпустить обновление
+
+1. Внесите изменения и увеличьте номер в файле `VERSION` (например, `2.0.0` → `2.1.0`).
+2. Сделайте push в ветку `main`. У пользователей кнопка «Проверить обновления» предложит новую версию (GitHub может отдавать старый `VERSION` ещё несколько минут).
+
+Версия на GitHub, которая старше или равна установленной, обновлением не считается, поэтому кнопка никогда не откатит приложение назад.
 
 Формат `~/.claude/limits.json` одинаков на всех системах:
 

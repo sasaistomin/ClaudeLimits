@@ -15,7 +15,8 @@ $InstallDir = Join-Path $env:LOCALAPPDATA 'ClaudeLimits'
 $Settings   = Join-Path $env:USERPROFILE '.claude\settings.json'
 $StartupDir = if ($env:CLAUDE_LIMITS_STARTUP_DIR) { $env:CLAUDE_LIMITS_STARTUP_DIR } else { [Environment]::GetFolderPath('Startup') }
 $NoLaunch   = [bool]$env:CLAUDE_LIMITS_NO_LAUNCH
-$Files      = @('ClaudeLimits.Core.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'uninstall.ps1')
+$Files      = @('ClaudeLimits.Core.ps1', 'ClaudeLimits.Parsers.ps1', 'ClaudeLimits.Monitoring.ps1', 'ClaudeLimits.ps1', 'statusline.ps1', 'uninstall.ps1')
+$ConfigFile = Join-Path $InstallDir 'config.json'
 
 Write-Host '==> ClaudeLimits: установка' -ForegroundColor Cyan
 
@@ -42,14 +43,40 @@ foreach ($f in $Files) {
 }
 
 . (Join-Path $InstallDir 'ClaudeLimits.Core.ps1')
+. (Join-Path $InstallDir 'ClaudeLimits.Parsers.ps1')
 
-# 3. Прописать statusLine в ~/.claude/settings.json
+# Версия (для пункта «Проверить обновления»): VERSION в корне проекта или на GitHub
+$version = ''
+$localVersion = if ($useLocal) { Join-Path (Split-Path -Parent $localDir) 'VERSION' } else { $null }
+try {
+    if ($localVersion -and (Test-Path -LiteralPath $localVersion)) { $version = [IO.File]::ReadAllText($localVersion) }
+    else { $version = Get-RemoteVersion "$RepoRaw/VERSION" }
+} catch { }
+$version = (($version -split "`n")[0] -replace '[^0-9.]', '')
+if (-not $version) { $version = '0.0.0' }
+[IO.File]::WriteAllText((Join-Path $InstallDir 'VERSION'), "$version`n", (New-Object Text.UTF8Encoding $false))
+Write-Host "==> Версия $version"
+
+# 3. Папки данных Claude Code и Claude Desktop, настройки по умолчанию в config.json
+$config = Read-Config $ConfigFile
+$codeDir = Split-Path -Parent ((New-LimitParser 'code' '').GetLogPath())
+if (-not (Test-Path -LiteralPath $codeDir)) { New-Item -ItemType Directory -Force -Path $codeDir | Out-Null }
+Write-Host "==> Claude Code: $codeDir"
+$desktop = New-LimitParser 'desktop' $config.desktop_path
+if ($desktop.IsInstalled()) {
+    Write-Host "==> Claude Desktop: $($desktop.GetLogPath())"
+} else {
+    Write-Host '==> Claude Desktop не найден: вкладка покажет «Не подключено». Папку можно указать в меню значка.' -ForegroundColor Yellow
+}
+Save-Config $config $ConfigFile
+
+# 4. Прописать statusLine в ~/.claude/settings.json
 $r = Set-ClaudeStatusLine $Settings (Get-StatusLineCommand $InstallDir)
 if (-not $r.Ok) { throw "Не удалось разобрать $Settings — исправьте JSON и запустите установку снова." }
 if ($r.Replaced) { Write-Host "Внимание: прежний statusLine ($($r.Replaced)) заменён. Копия: settings.json.bak" -ForegroundColor Yellow }
 Write-Host "==> statusLine прописан в $Settings"
 
-# 4. Автозапуск при входе в Windows
+# 5. Автозапуск при входе в Windows
 $trayScript = Join-Path $InstallDir 'ClaudeLimits.ps1'
 $psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
 $psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$trayScript`""
@@ -61,7 +88,7 @@ $lnk.Arguments = $psArgs
 $lnk.WindowStyle = 7
 $lnk.Save()
 
-# 5. Запуск
+# 6. Запуск
 if (-not $NoLaunch) {
     Start-Process -FilePath $psExe -ArgumentList $psArgs -WindowStyle Hidden
     Write-Host ''

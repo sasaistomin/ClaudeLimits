@@ -110,6 +110,18 @@ assert_eq "$code" 0 "установка через «| bash» (скрипт из
 rm -rf "$lone"
 assert "[ -x '$BIN' ]" "бинарник на месте"
 
+echo "== Обновления"
+assert_eq "$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist")" "$(tr -d '[:space:]' < "$REPO/VERSION")" "версия приложения = VERSION"
+fake="$(mktemp -d)"; echo "99.0.0" > "$fake/VERSION"
+out=$(CLAUDE_LIMITS_REPO_RAW="file://$fake" "$BIN" --check-update); code=$?
+assert_eq "$code" 10 "--check-update находит новую версию ($out)"
+echo "1.0.0" > "$fake/VERSION"
+out=$(CLAUDE_LIMITS_REPO_RAW="file://$fake" "$BIN" --check-update); code=$?
+assert_eq "$code" 0 "старая версия на сервере — обновления нет ($out)"
+CLAUDE_LIMITS_REPO_RAW="file://$fake/nope" "$BIN" --check-update >/dev/null; code=$?
+assert_eq "$code" 1 "сервер недоступен — ошибка, а не обновление"
+rm -rf "$fake"
+
 echo "== Интерфейс"
 now=$(date +%s)
 cat > "$LIMITS" <<EOF
