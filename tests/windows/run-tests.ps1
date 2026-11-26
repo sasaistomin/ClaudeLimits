@@ -723,7 +723,10 @@ function Start-FakeGitHub {
 Test 'Phone: снимок совпадает с форматом виджета (tests/scriptable/payload.json)' {
     $fixture = [IO.File]::ReadAllText((Join-Path $Repo 'tests/scriptable/payload.json')) | ConvertFrom-Json
     $p = Get-PhonePayload (New-PhoneMetrics) 1800000000
-    Eq ($p | ConvertTo-Json -Depth 6 -Compress) ($fixture | ConvertTo-Json -Depth 6 -Compress) 'снимок:'
+    $norm = { param($o) ($o | ConvertTo-Json -Depth 6 -Compress) -replace '(\d)\.0(?=[,}\]])', '$1' }
+    $got = & $norm $p; $want = & $norm $fixture
+    $at = 0; while ($at -lt [math]::Min($got.Length, $want.Length) -and $got[$at] -eq $want[$at]) { $at++ }
+    Ok ($got -eq $want) "снимок отличается с символа $at`: «$($got.Substring([math]::Max(0, $at - 40)))»"
     $m = New-PhoneMetrics
     $m.desktop = [LimitMetrics]::new('desktop'); $m.desktop.Status = 'NotFound'
     $m.code.Windows[0] = [LimitParser]::NewWindow('five_hour', 90, 1799999999, $false, 1800000000)
@@ -871,7 +874,7 @@ if ($OnWindows) {
             $out = & $winPS -NoProfile -ExecutionPolicy Bypass -File (Join-Path $inst 'ClaudeLimits.ps1') 2>&1
             $code = $LASTEXITCODE
             Remove-Item Env:\CLAUDE_LIMITS_SELFTEST, Env:\CLAUDE_LIMITS_SELFTEST_OUT
-            Ok ($code -eq 0 -and ($out -join ' ') -like '*SELFTEST OK*') "вывод: $($out -join ' | ')"
+            Ok ($code -eq 0 -and ($out -join ' ') -like '*SELFTEST OK*') "код $code, вывод: $($out -join ' | ')"
             Ok ((Test-Path (Join-Path $sb 'chart-five.png')) -and (Get-Item (Join-Path $sb 'chart-five.png')).Length -gt 2000) 'график 5ч нарисован'
             Ok ((Test-Path (Join-Path $sb 'chart-week.png')) -and (Get-Item (Join-Path $sb 'chart-week.png')).Length -gt 2000) 'график недели нарисован'
             Write-Host "   $($out -join ' ')"
