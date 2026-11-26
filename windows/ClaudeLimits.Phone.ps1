@@ -37,18 +37,18 @@ function Save-PhoneConfig([string]$Token, [string]$GistId, [string]$Path = (Get-
 
 # Снимок для виджета: только источники с данными, проценты как есть (виджет сам обнуляет прошедшие окна).
 function Get-PhonePayload([hashtable]$Metrics, [int64]$Now = (Get-UnixNow)) {
-    $sources = [ordered]@{}
+    $bySource = [ordered]@{}
     foreach ($source in $Sources) {
         $m = $Metrics[$source]
         if (-not $m -or $m.Status -ne 'Ok' -or @($m.Windows).Count -eq 0) { continue }
-        $sources[$source] = [ordered]@{
+        $bySource[$source] = [ordered]@{
             updated = [int64]$m.Updated
             windows = @(foreach ($w in $m.Windows) {
                 [ordered]@{ id = $w.Id; used = [double]$w.RawUsed; resets_at = [int64]$w.Reset; rolling = [bool]$w.Rolling }
             })
         }
     }
-    return [ordered]@{ v = 1; sent_at = $Now; sources = $sources }
+    return [ordered]@{ v = 1; sent_at = $Now; sources = $bySource }
 }
 
 function Get-PhonePayloadKey($Payload) { $Payload.sources | ConvertTo-Json -Depth 6 -Compress }

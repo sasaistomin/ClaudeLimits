@@ -33,6 +33,11 @@ namespace ClaudeLimits {
             }
         }
 
+        public static long FileLength(string path) {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                return fs.Length;
+        }
+
         public static string Latin1(byte[] bytes) {
             return Encoding.GetEncoding(28591).GetString(bytes);
         }
@@ -492,13 +497,15 @@ class ClaudeDesktopParser : LimitParser {
     }
 
     hidden [object] ScanJournal([IO.FileInfo]$file) {
+        $len = $file.Length
+        try { $len = ([LimitParser]::LevelDb())::FileLength($file.FullName) } catch { }
         $j = $this.Journals[$file.FullName]
-        if (-not $j -or $file.Length -lt $j.Offset) {
+        if (-not $j -or $len -lt $j.Offset) {
             $j = @{ Offset = [int64]0; Tail = ''; Best = $null }
             $this.Journals[$file.FullName] = $j
             $this.Records[$file.FullName] = @()
         }
-        if ($file.Length -eq $j.Offset) { return $j.Best }
+        if ($len -eq $j.Offset) { return $j.Best }
         try {
             $ldb = [LimitParser]::LevelDb()
             $bytes = $ldb::ReadShared($file.FullName, $j.Offset)

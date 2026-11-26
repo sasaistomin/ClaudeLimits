@@ -297,9 +297,10 @@ Test 'Обновления: сравнение версий, VERSION по URL, �
     Eq (Get-InstalledVersion $d) '0.0.0' 'нет файла:'
     Write-Utf8 (Join-Path $d 'VERSION') "2.0.0`n"
     Eq (Get-InstalledVersion $d) '2.0.0'
-    Eq (Get-RemoteVersion ([Uri](Join-Path $d 'VERSION')).AbsoluteUri) '2.0.0' 'VERSION по file://:'
+    $fileUrl = { param($path) if ($OnWindows) { ([Uri]$path).AbsoluteUri } else { 'file://' + $path } }
+    Eq (Get-RemoteVersion (& $fileUrl (Join-Path $d 'VERSION'))) '2.0.0' 'VERSION по file://:'
     $failed = $false
-    try { [void](Get-RemoteVersion ([Uri](Join-Path $d 'нет')).AbsoluteUri) } catch { $failed = $true }
+    try { [void](Get-RemoteVersion (& $fileUrl (Join-Path $d 'нет'))) } catch { $failed = $true }
     Ok $failed 'недоступный адрес -> ошибка, а не обновление'
     $a = Get-UpdateArguments 'https://example.test/repo'
     Ok ($a -like '*https://example.test/repo/windows/install.ps1*' -and $a -like '*-ExecutionPolicy Bypass*') "команда обновления: $a"
@@ -318,7 +319,7 @@ Test 'settings.json: прописать и убрать statusLine' {
 
     $r = Set-ClaudeStatusLine $p $cmd
     Ok $r.Ok 'создаёт settings.json, если его нет'
-    Eq (Get-Content -Raw $p | ConvertFrom-Json).statusLine.command $cmd
+    Eq ([IO.File]::ReadAllText($p) | ConvertFrom-Json).statusLine.command $cmd 'команда в settings.json:'
 
     Write-Utf8 $p '{"model":"opus","theme":"dark","permissions":{"allow":["Bash(ls)"]},"statusLine":{"type":"command","command":"~/my.sh"}}'
     $r = Set-ClaudeStatusLine $p $cmd

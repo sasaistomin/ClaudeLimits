@@ -274,7 +274,7 @@ function Read-History([string]$Path) {
     try {
         $lines = @([IO.File]::ReadAllLines($Path) | Where-Object { $_.Trim() })
         if ($lines.Count -eq 0) { return @() }
-        return @(('[' + ($lines -join ',') + ']') | ConvertFrom-Json)
+        return @((('[' + ($lines -join ',') + ']') | ConvertFrom-Json) | ForEach-Object { $_ })
     } catch { return @() }
 }
 
@@ -366,7 +366,7 @@ function Get-UpdateArguments([string]$RepoRaw = (Get-RepoRaw)) {
 # ---------- settings.json Claude Code (для install.ps1 / uninstall.ps1) ----------
 
 function Get-StatusLineCommand([string]$InstallDir) {
-    $sl = (Join-Path $InstallDir 'statusline.ps1') -replace '\\', '/'
+    $sl = ($InstallDir.TrimEnd('\', '/') + '/statusline.ps1') -replace '\\', '/'
     return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$sl`""
 }
 
