@@ -30,7 +30,7 @@ struct LimitWindow: Equatable {
         self.raw = raw
         self.resetsAt = resetsAt
         self.rolling = rolling
-        self.used = resetsAt < now ? 0 : raw
+        self.used = resetsAt <= now ? 0 : clampPercent(raw)
     }
 }
 

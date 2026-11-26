@@ -34,6 +34,8 @@ const STRINGS = {
       : s < 86400 ? `${Math.floor(s / 3600)} ч назад` : `${Math.floor(s / 86400)} д назад`,
     updated: 'обновлено', noData: 'Нет данных', noDataHint: 'Отправьте сообщение Claude на компьютере.',
     noId: 'Укажите ID gist', noIdHint: 'Parameter виджета или GIST_ID в скрипте.',
+    notFound: 'Gist не найден', notFoundHint: (id) => `Проверьте ID в Parameter: «${id}»`,
+    netError: 'Нет связи с GitHub',
     offline: 'Нет связи, показаны прошлые данные',
   },
   en: {
@@ -45,6 +47,8 @@ const STRINGS = {
       : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`,
     updated: 'updated', noData: 'No data', noDataHint: 'Send Claude a message on your computer.',
     noId: 'Set the gist ID', noIdHint: 'Widget Parameter or GIST_ID in the script.',
+    notFound: 'Gist not found', notFoundHint: (id) => `Check the ID in Parameter: "${id}"`,
+    netError: 'Can’t reach GitHub',
     offline: 'Offline, showing cached data',
   },
 }
@@ -56,11 +60,17 @@ const COLORS = { green: '#34C759', yellow: '#FFB800', red: '#FF3B30', none: '#8E
 
 function strings(lang) { return STRINGS[String(lang || '').toLowerCase().startsWith('ru') ? 'ru' : 'en'] }
 
+// Parameter виджета: ID gist (или ссылка на него, или целая строка «ID для виджета: …») и, по желанию, code/desktop.
 function parseParameter(param, fallbackId) {
-  const parts = String(param || '').trim().split(/[\s,;|]+/).filter(Boolean)
-  const source = parts.find((p) => p === 'code' || p === 'desktop') || null
-  const id = parts.find((p) => p !== 'code' && p !== 'desktop') || fallbackId || ''
-  return { id: id.replace(/^https?:\/\/gist\.github\.com\/(?:[^/]+\/)?/, '').replace(/[/#?].*$/, ''), source }
+  const raw = String(param || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF\u00A0]/g, ' ')
+  const words = raw.toLowerCase().match(/[a-z]+/g) || []
+  const source = words.includes('desktop') ? 'desktop' : words.includes('code') ? 'code' : null
+  const hex = raw.match(/[0-9a-f]{20,}/i)
+  if (hex) return { id: hex[0].toLowerCase(), source }
+  const parts = raw.trim().split(/[\s,;|]+/).filter((p) => p && !/^(code|desktop)$/i.test(p))
+  const id = (parts[parts.length - 1] || fallbackId || '')
+    .replace(/^https?:\/\/gist\.github\.com\/(?:[^/]+\/)?/, '').replace(/[/#?].*$/, '')
+  return { id, source }
 }
 
 function level(used) { return used >= 90 ? 'red' : used >= 70 ? 'yellow' : 'green' }
@@ -97,14 +107,17 @@ function buildModel(payload, now, lang) {
   for (const key of ['code', 'desktop']) {
     const s = raw[key]
     if (!s || !Array.isArray(s.windows) || s.windows.length === 0) continue
-    const windows = s.windows.map((w) => {
-      const used = w.resets_at <= now ? 0 : Math.max(0, Math.min(100, Number(w.used) || 0))
+    const valid = s.windows.filter((w) => w && typeof w === 'object' && (w.id === 'five_hour' || w.id === 'seven_day'))
+    if (valid.length === 0) continue
+    const windows = valid.map((w) => {
+      const resetsAt = Number(w.resets_at) || 0
+      const used = resetsAt <= now ? 0 : Math.max(0, Math.min(100, Number(w.used) || 0))
       const title = w.rolling ? t.rolling : w.id === 'five_hour' ? t.five : t.week
-      const live = w.resets_at > now
+      const live = resetsAt > now
       return {
         id: w.id, title, short: w.id === 'five_hour' ? t.five1 : t.week1, used, left: Math.round(100 - used),
-        level: level(used), resetsAt: w.resets_at,
-        countdown: live ? countdown(w.resets_at, now, t) : '', countdownShort: live ? countdown(w.resets_at, now, t, true) : '',
+        level: level(used), resetsAt,
+        countdown: live ? countdown(resetsAt, now, t) : '', countdownShort: live ? countdown(resetsAt, now, t, true) : '',
       }
     })
     const updated = Number(s.updated) || 0
@@ -142,7 +155,12 @@ async function loadPayload(id) {
     let payload = payloadFromGist(gist)
     const f = gist && gist.files && gist.files[GIST_FILE]
     if (!payload && f && f.truncated && f.raw_url) payload = await new Request(f.raw_url).loadJSON()
-    if (!payload) throw new Error(gist && gist.message ? gist.message : 'no data')
+    if (!payload) {
+      const err = new Error(gist && gist.message ? gist.message : 'no data')
+      const message = (gist && gist.message) || ''
+      err.kind = /not found/i.test(message) ? 'notFound' : message ? 'apiError' : 'noData'
+      throw err
+    }
     fm.writeString(cachePath, JSON.stringify({ id, fetched: now, payload }))
     return { payload, offline: false }
   } catch (e) {
@@ -383,7 +401,11 @@ async function buildWidget() {
   if (!id) return emptyWidget(w, t.noId, t.noIdHint)
 
   let loaded
-  try { loaded = await loadPayload(id) } catch (e) { return emptyWidget(w, t.noData, String(e.message || e)) }
+  try { loaded = await loadPayload(id) } catch (e) {
+    if (e.kind === 'notFound') return emptyWidget(w, t.notFound, t.notFoundHint(id))
+    if (e.kind === 'noData') return emptyWidget(w, t.noData, t.noDataHint)
+    return emptyWidget(w, t.netError, String(e.message || e))
+  }
   const model = buildModel(loaded.payload, Date.now() / 1000, Device.language())
   const src = pickSource(model, source)
   if (!src) return emptyWidget(w, t.noData, t.noDataHint)

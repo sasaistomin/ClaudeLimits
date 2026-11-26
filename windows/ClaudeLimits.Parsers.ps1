@@ -290,7 +290,7 @@ class LimitParser {
         $w = [LimitWindow]::new()
         $w.Id = $id
         $w.RawUsed = $rawUsed
-        $w.Used = if ($reset -lt $now) { 0.0 } else { $rawUsed }
+        $w.Used = if ($reset -le $now) { 0.0 } else { [math]::Min(100.0, [math]::Max(0.0, $rawUsed)) }
         $w.Left = [math]::Max(0.0, 100.0 - $w.Used)
         $w.Reset = $reset
         $w.Rolling = $rolling
@@ -310,9 +310,9 @@ class ClaudeCodeParser : LimitParser {
     hidden [string]$Stamp = ''
     hidden [object]$Data
 
-    ClaudeCodeParser([string]$path) : base('code') {
-        if (-not $path) { $path = [IO.Path]::Combine([LimitParser]::UserHome(), '.claude', 'limits.json') }
-        $this.Path = $path
+    ClaudeCodeParser([string]$limitsPath) : base('code') {
+        if (-not $limitsPath) { $limitsPath = [IO.Path]::Combine([LimitParser]::UserHome(), '.claude', 'limits.json') }
+        $this.Path = $limitsPath
     }
 
     [string] GetLogPath() { return $this.Path }
@@ -324,12 +324,12 @@ class ClaudeCodeParser : LimitParser {
         if (-not (Test-Path -LiteralPath $this.Path)) { return $m }
         try {
             $file = [IO.FileInfo]::new($this.Path)
-            $stamp = '{0}|{1}' -f $file.Length, $file.LastWriteTimeUtc.Ticks
-            if ($stamp -ne $this.Stamp) {
+            $current = '{0}|{1}' -f $file.Length, $file.LastWriteTimeUtc.Ticks
+            if ($current -ne $this.Stamp) {
                 $ldb = [LimitParser]::LevelDb()
                 $text = [Text.Encoding]::UTF8.GetString($ldb::ReadShared($this.Path, 0)).TrimStart([char]0xFEFF)
                 $this.Data = $text | ConvertFrom-Json
-                $this.Stamp = $stamp
+                $this.Stamp = $current
             }
         } catch {
             $this.Data = $null

@@ -187,10 +187,10 @@ def read_limits(path=None, now=None):
     res = {'updated': float(d.get('updated_at') or 0), 'model': d.get('model'), FIVE: None, WEEK: None}
     for k in (FIVE, WEEK):
         w = rl.get(k)
-        if isinstance(w, dict) and w.get('used_percentage') is not None:
-            raw = float(w['used_percentage'])
-            reset = int(w.get('resets_at') or 0)
-            used = 0.0 if reset < now else raw
+        raw = _number(w.get('used_percentage')) if isinstance(w, dict) else None
+        if raw is not None:
+            reset = int(_number(w.get('resets_at')) or 0)
+            used = 0.0 if reset <= now else clamp_percent(raw)
             res[k] = {'used': used, 'raw': raw, 'left': max(0.0, 100 - used), 'reset': reset}
     return res
 
@@ -339,9 +339,19 @@ def read_history(path=None):
         pass
     return out
 
+def _number(v):
+    """Конечное число из JSON или None: строки, true/false, null, inf и nan не считаются числом."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    return v if math.isfinite(v) else None
+
+def clamp_percent(v):
+    return min(100.0, max(0.0, v))
+
 def _used(rl, k):
-    w = (rl or {}).get(k) if isinstance(rl, dict) else None
-    return float(w['used_percentage']) if isinstance(w, dict) and w.get('used_percentage') is not None else None
+    w = rl.get(k) if isinstance(rl, dict) else None
+    return _number(w.get('used_percentage')) if isinstance(w, dict) else None
 
 def append_history_if_changed(old_rl, new_rl, path=None, now=None):
     """Дописывает строку, если проценты изменились (или истории ещё нет). Возвращает True, если дописал."""
@@ -352,9 +362,9 @@ def append_history_if_changed(old_rl, new_rl, path=None, now=None):
         return False
     s = {'t': now}
     if isinstance(new_rl.get(FIVE), dict):
-        s['f'] = _used(new_rl, FIVE); s['fr'] = int(new_rl[FIVE].get('resets_at') or 0)
+        s['f'] = _used(new_rl, FIVE); s['fr'] = int(_number(new_rl[FIVE].get('resets_at')) or 0)
     if isinstance(new_rl.get(WEEK), dict):
-        s['w'] = _used(new_rl, WEEK); s['wr'] = int(new_rl[WEEK].get('resets_at') or 0)
+        s['w'] = _used(new_rl, WEEK); s['wr'] = int(_number(new_rl[WEEK].get('resets_at')) or 0)
     with open(path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(s, separators=(',', ':')) + '\n')
     prune_history(path, now)
@@ -466,7 +476,7 @@ def statusline(raw_input, now=None):
     for k, name in ((FIVE, '5h'), (WEEK, '7d')):
         u = _used(rl, k) if isinstance(rl, dict) else None
         if u is not None:
-            parts.append('{0}: {1}%'.format(name, int(math.floor(u + 0.5))))
+            parts.append('{0}: {1}%'.format(name, int(math.floor(clamp_percent(u) + 0.5))))
     return '[{0}]'.format(model) + (' ' + ' '.join(parts) if parts else '')
 
 

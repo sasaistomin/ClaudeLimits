@@ -113,6 +113,19 @@ class TestLimits(Sandbox):
         self.write({'model': 'x'})
         self.assertIsNone(core.read_limits(now=NOW))
 
+    def test_boundaries(self):
+        rl = {'five_hour': {'used_percentage': 50, 'resets_at': NOW},
+              'seven_day': {'used_percentage': -1, 'resets_at': NOW + 60}}
+        self.write({'updated_at': NOW, 'rate_limits': rl})
+        l = core.read_limits(now=NOW)
+        self.assertEqual(l[core.FIVE]['used'], 0)       # ровно в момент сброса окно уже обнулено
+        self.assertEqual(l[core.WEEK]['left'], 100)     # отрицательный процент не даёт остаток больше 100%
+        self.write({'updated_at': NOW, 'rate_limits': {'five_hour': {'used_percentage': 'abc', 'resets_at': NOW + 60},
+                                                       'seven_day': {'used_percentage': 150, 'resets_at': 'soon'}}})
+        l = core.read_limits(now=NOW)
+        self.assertIsNone(l[core.FIVE])
+        self.assertEqual(l[core.WEEK]['used'], 0)
+
 
 class TestNotify(unittest.TestCase):
     def test_thresholds_once_per_window(self):
@@ -245,6 +258,18 @@ class TestStatusline(Sandbox):
         self.assertEqual(core.statusline('{"model":{"display_name":"Модель"}}'), '[Модель]')
         self.assertFalse(os.path.exists(core.limits_path()))
         self.assertEqual(core.statusline('{"rate_limits":{"seven_day":{"used_percentage":5,"resets_at":1}}}'), '[Claude] 7d: 5%')
+
+    def test_odd_values_same_as_macos_and_windows(self):
+        one = lambda u, r=NOW + 60: json.dumps({'model': {'display_name': 'Opus'}, 'rate_limits': {'five_hour': {'used_percentage': u, 'resets_at': r}}})
+        self.assertEqual(core.statusline('{"model":{"display_name":"Opus"},"rate_limits":{}}', NOW), '[Opus]')
+        self.assertFalse(os.path.exists(core.limits_path()), 'пустой rate_limits не записывается')
+        self.assertEqual(core.statusline(one(1e308), NOW), '[Opus] 5h: 100%')
+        self.assertEqual(core.statusline(one(-5), NOW), '[Opus] 5h: 0%')
+        self.assertEqual(core.statusline(one('42'), NOW), '[Opus]')
+        self.assertEqual(core.statusline(one(True), NOW), '[Opus]')
+        self.assertEqual(core.statusline(one(42, 'soon'), NOW), '[Opus] 5h: 42%')
+        with open(core.limits_path(), encoding='utf-8') as f:
+            self.assertEqual(json.load(f)['rate_limits']['five_hour']['resets_at'], 'soon', 'данные сохранены как есть')
 
     def test_prune(self):
         os.makedirs(core.claude_dir(), exist_ok=True)

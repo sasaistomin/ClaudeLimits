@@ -538,6 +538,17 @@ enum UnitTests {
             check(!sync.tick(now: now + 1000) && !sync.enabled, "настройки удалены — выгрузка выключена")
         }
 
+        // MARK: Граничные значения и необычные данные
+        test("Граничные значения: сброс ровно сейчас, проценты вне 0…100, типы из JSON") {
+            eq(LimitWindow(id: "five_hour", raw: 50, resetsAt: now, rolling: false, now: now).used, 0, "ровно в момент сброса:")
+            eq(LimitWindow(id: "five_hour", raw: 50, resetsAt: now + 1, rolling: false, now: now).used, 50, "за секунду до сброса:")
+            eq(LimitWindow(id: "five_hour", raw: -1, resetsAt: now + 60, rolling: false, now: now).left, 100, "отрицательный процент:")
+            eq(LimitWindow(id: "five_hour", raw: 150, resetsAt: now + 60, rolling: false, now: now).left, 0, "больше 100%:")
+            eq(jsonNumber(NSNumber(value: 42.5)), 42.5)
+            check(jsonNumber(NSNumber(value: true)) == nil, "true — не число")
+            check(jsonNumber("42") == nil && jsonNumber(nil) == nil && jsonNumber(Double.infinity) == nil, "строка, nil, inf")
+        }
+
         // MARK: Итог
         print("")
         if failed.isEmpty {

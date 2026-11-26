@@ -67,6 +67,15 @@ out=$("$BIN" --statusline < /dev/null)
 assert_eq "$out" "[Claude]" "пустой ввод"
 out=$(echo '{"model":{"display_name":"Sonnet"},"rate_limits":{"seven_day":{"used_percentage":5,"resets_at":1}}}' | "$BIN" --statusline)
 assert_eq "$out" "[Sonnet] 7d: 5%" "только недельное окно"
+one() { echo "{\"model\":{\"display_name\":\"Opus\"},\"rate_limits\":{\"five_hour\":{\"used_percentage\":$1,\"resets_at\":${2:-9999999999}}}}"; }
+out=$(one 1e308 | "$BIN" --statusline); code=$?
+assert_eq "$out|$code" "[Opus] 5h: 100%|0" "огромный процент не роняет statusline"
+assert_eq "$(one -5 | "$BIN" --statusline)" "[Opus] 5h: 0%" "отрицательный процент"
+assert_eq "$(one '"42"' | "$BIN" --statusline)" "[Opus]" "процент строкой не показывается"
+assert_eq "$(one true | "$BIN" --statusline)" "[Opus]" "true — не процент"
+cp "$LIMITS" "$SB/limits-before.json"
+assert_eq "$(echo '{"model":{"display_name":"Opus"},"rate_limits":{}}' | "$BIN" --statusline)" "[Opus]" "пустой rate_limits"
+assert "cmp -s '$LIMITS' '$SB/limits-before.json'" "пустой rate_limits не перезаписывает limits.json"
 
 # Ровно так, как Claude Code запускает команду из settings.json (через shell, с кавычками)
 cmd="$(json "$SETTINGS" statusLine.command)"

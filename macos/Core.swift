@@ -21,7 +21,7 @@ enum StatusLine {
         let model = (json["model"] as? [String: Any])?["display_name"] as? String ?? "Claude"
         let rl = json["rate_limits"] as? [String: Any]
 
-        if let rl {
+        if let rl, !rl.isEmpty {
             History.appendIfChanged(new: rl)
             let out: [String: Any] = [
                 "updated_at": Int(Date().timeIntervalSince1970),
@@ -35,7 +35,7 @@ enum StatusLine {
         }
 
         func pct(_ key: String) -> Int? {
-            ((rl?[key] as? [String: Any])?["used_percentage"] as? NSNumber).map { Int($0.doubleValue.rounded()) }
+            jsonNumber((rl?[key] as? [String: Any])?["used_percentage"]).map { Int(clampPercent($0).rounded()) }
         }
         var parts: [String] = []
         if let f = pct("five_hour") { parts.append("5h: \(f)%") }
@@ -43,6 +43,14 @@ enum StatusLine {
         print(parts.isEmpty ? "[\(model)]" : "[\(model)] " + parts.joined(separator: " "))
     }
 }
+
+/// Конечное число из JSON или nil: строки, true/false, null, inf и nan не считаются числом.
+func jsonNumber(_ v: Any?) -> Double? {
+    guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite else { return nil }
+    return n.doubleValue
+}
+
+func clampPercent(_ v: Double) -> Double { min(100, max(0, v)) }
 
 // MARK: - Installer (settings.json)
 
@@ -203,10 +211,10 @@ enum History {
     static let maxBytes = 512 * 1024
 
     private static func used(_ rl: [String: Any]?, _ k: String) -> Double? {
-        ((rl?[k] as? [String: Any])?["used_percentage"] as? NSNumber)?.doubleValue
+        jsonNumber((rl?[k] as? [String: Any])?["used_percentage"])
     }
     private static func reset(_ rl: [String: Any]?, _ k: String) -> Double? {
-        ((rl?[k] as? [String: Any])?["resets_at"] as? NSNumber)?.doubleValue
+        jsonNumber((rl?[k] as? [String: Any])?["resets_at"])
     }
 
     /// Вызывается из --statusline до перезаписи limits.json: дописывает строку, только если проценты изменились.

@@ -38,7 +38,7 @@ class LimitMetrics:
 
 
 def make_window(wid, raw, reset, rolling, now):
-    used = 0.0 if reset < now else raw
+    used = 0.0 if reset <= now else min(100.0, max(0.0, raw))
     return {'id': wid, 'used': used, 'raw': raw, 'left': max(0.0, 100 - used), 'reset': reset, 'rolling': rolling}
 
 

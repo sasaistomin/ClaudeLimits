@@ -673,6 +673,15 @@ Test 'statusline.ps1: запись данных, история, устойчи�
     Eq ([IO.File]::ReadAllText($limits)) $before 'без rate_limits limits.json не трогается:'
     $r = Invoke-StatusLine 'не json' $d
     Ok ($r.Out -eq '[Claude]' -and $r.Code -eq 0) "битый ввод: $($r.Out) / $($r.Code)"
+    $r = Invoke-StatusLine '{"model":{"display_name":"Opus"},"rate_limits":{}}' $d
+    Eq $r.Out '[Opus]' 'пустой rate_limits:'
+    Eq ([IO.File]::ReadAllText($limits)) $before 'пустой rate_limits limits.json не трогается:'
+    $one = { param($u) '{"model":{"display_name":"Opus"},"rate_limits":{"five_hour":{"used_percentage":' + $u + ',"resets_at":' + ($now + 3600) + '}}}' }
+    Eq (Invoke-StatusLine (& $one '1e308') $d).Out '[Opus] 5h: 100%' 'огромный процент:'
+    Eq (Invoke-StatusLine (& $one '-5') $d).Out '[Opus] 5h: 0%' 'отрицательный процент:'
+    Eq (Invoke-StatusLine (& $one '42.5') $d).Out '[Opus] 5h: 43%' 'округление .5 вверх, как на macOS и Linux:'
+    Eq (Invoke-StatusLine (& $one '"42"') $d).Out '[Opus]' 'процент строкой не показывается:'
+    Eq (Invoke-StatusLine (& $one 'true') $d).Out '[Opus]' 'true — не процент:'
 
     # очистка истории > 512 КБ
     $old = $now - 20 * 86400

@@ -38,6 +38,11 @@ function test(name, fn) {
     assert.strictEqual(W.parseParameter('https://gist.github.com/f00d#file', '').id, 'f00d')
     assert.strictEqual(W.parseParameter('', 'fallback').id, 'fallback')
     assert.strictEqual(W.parseParameter(null, '').id, '')
+    const id = '32c0036e100f988245fc21f26b2e665e'
+    assert.deepStrictEqual(W.parseParameter(`ID для виджета:  ${id}`, ''), { id, source: null }, 'строка целиком из терминала')
+    assert.deepStrictEqual(W.parseParameter(`«${id}». Desktop`, ''), { id, source: 'desktop' }, 'кавычки, точка, регистр')
+    assert.strictEqual(W.parseParameter(`\u200B${id.toUpperCase()}\u00A0`, '').id, id, 'невидимые символы и верхний регистр')
+    assert.strictEqual(W.parseParameter(`https://gist.github.com/someone/${id}`, '').id, id)
   })
 
   test('level и countdown как в приложении', () => {
@@ -101,6 +106,15 @@ function test(name, fn) {
     assert.strictEqual(W.countdown(NOW + 300, NOW, W.strings('ru'), true), '5 мин')
   })
 
+  test('граничные значения и испорченные окна', () => {
+    const one = (windows) => W.buildModel({ sources: { code: { updated: NOW, windows } } }, NOW, 'ru')
+    assert.strictEqual(one([{ id: 'five_hour', used: 50, resets_at: NOW }]).sources[0].windows[0].used, 0, 'ровно в момент сброса')
+    assert.strictEqual(one([{ id: 'five_hour', used: 50, resets_at: NOW + 1 }]).sources[0].windows[0].used, 50, 'за секунду до сброса')
+    const m = one([null, 'x', { id: 'five_hour', used: 42 }, { id: 'seven_day', used: -1, resets_at: NOW + 60 }])
+    assert.deepStrictEqual(m.sources[0].windows.map((w) => [w.id, w.left, w.countdown]), [['five_hour', 100, ''], ['seven_day', 100, 'через 1 мин']])
+    assert.strictEqual(one([null]).sources.length, 0, 'без годных окон источника нет')
+  })
+
   test('pickSource: заданный, иначе самый свежий', () => {
     const m = W.buildModel(payload, NOW, 'ru')
     assert.strictEqual(W.pickSource(m, 'desktop').key, 'desktop')
@@ -146,7 +160,8 @@ function test(name, fn) {
         async loadJSON() {
           log.requests++
           if (!fetchOk) throw new Error('offline')
-          assert.ok(this.url.endsWith('/gists/abc123'), this.url)
+          if (this.url.endsWith('/gists/limited')) return { message: 'API rate limit exceeded' }
+          if (!this.url.endsWith('/gists/abc123')) return { message: 'Not Found' }
           return { files: { 'claude-limits.json': { content: JSON.stringify(payload) } } }
         }
       },
@@ -218,7 +233,15 @@ function test(name, fn) {
     const log = await runScript(fakeScriptable({ family: 'medium', param: '' }))
     test('нет ID: подсказка', () => assert.ok(log.texts.includes('Укажите ID gist'), log.texts.join(' | ')))
     const log2 = await runScript(fakeScriptable({ family: 'medium', param: 'abc123', fetchOk: false, lang: 'en' }))
-    test('нет связи и кэша: «No data»', () => assert.ok(log2.texts.includes('No data'), log2.texts.join(' | ')))
+    test('нет связи и кэша: понятная ошибка', () => assert.ok(log2.texts.includes('Can’t reach GitHub'), log2.texts.join(' | ')))
+    const log4 = await runScript(fakeScriptable({ family: 'small', param: 'wrongid' }))
+    test('неверный ID: понятная ошибка с этим ID', () => {
+      assert.ok(log4.texts.includes('Gist не найден') && log4.texts.includes('Проверьте ID в Parameter: «wrongid»'), log4.texts.join(' | '))
+    })
+    const log5 = await runScript(fakeScriptable({ family: 'small', param: 'limited' }))
+    test('лимит запросов GitHub: показан ответ GitHub, а не «нет данных»', () => {
+      assert.ok(log5.texts.includes('Нет связи с GitHub') && log5.texts.includes('API rate limit exceeded'), log5.texts.join(' | '))
+    })
     const log3 = await runScript(fakeScriptable({ family: undefined, param: 'abc123', inWidget: false }))
     test('запуск в приложении: предпросмотр', () => assert.ok(log3.presented && log3.completed))
   }
