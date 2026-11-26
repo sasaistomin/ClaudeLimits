@@ -810,6 +810,48 @@ Test 'Phone: фоновая выгрузка и phone.ps1 с поддельны�
     }
 }
 
+# ============================================================ 3в. Граничные значения (QA_RTM.md, раздел 5)
+Write-Host '== Граничные значения (BV-01…BV-16, BV-20)'
+
+Test 'Граничные значения: те же случаи, что для macOS, Linux и виджета' {
+    $N = [int64]1800000000
+    $win = { param($u, $r) [LimitParser]::NewWindow('five_hour', $u, $r, $false, $N) }
+    $ev = { param($raw, $reset, $seen, $th)
+        if (-not $seen) { $seen = @{} }
+        if (-not $th) { $th = @(95, 80) }
+        $e = Get-NotifyEvent 'five_hour' @{ RawUsed = $raw; Reset = $reset } $seen $N $th
+        if ($null -eq $e) { '—' } elseif ($e.Type -eq 'reset') { 'reset' } else { [string]$e.Threshold } }
+    $cd = { param($s) Format-Countdown ($N + $s) $ru $N }
+    $cases = @(
+        @('BV-01.1', (Get-Level 69.9), 'green'), @('BV-01.2', (Get-Level 70), 'yellow'), @('BV-01.3', (Get-Level 70.1), 'yellow'),
+        @('BV-02.1', (Get-Level 89.9), 'yellow'), @('BV-02.2', (Get-Level 90), 'red'), @('BV-02.3', (Get-Level 90.1), 'red'),
+        @('BV-03.1', (& $win -1 ($N + 60)).Left, 100), @('BV-03.2', (& $win 0 ($N + 60)).Left, 100), @('BV-03.3', (& $win 1 ($N + 60)).Left, 99),
+        @('BV-04.1', (& $win 99 ($N + 60)).Left, 1), @('BV-04.2', (& $win 100 ($N + 60)).Left, 0), @('BV-04.3', (& $win 101 ($N + 60)).Left, 0),
+        @('BV-05.1', (& $win 50 ($N + 1)).Used, 50), @('BV-05.2', (& $win 50 $N).Used, 0), @('BV-05.3', (& $win 50 ($N - 1)).Used, 0),
+        @('BV-06.1', (& $cd -1), 'сброшен'), @('BV-06.2', (& $cd 0), 'сброшен'), @('BV-06.3', (& $cd 1), 'через 0 мин'),
+        @('BV-07.1', (& $cd 59), 'через 0 мин'), @('BV-07.2', (& $cd 60), 'через 1 мин'), @('BV-07.3', (& $cd 3599), 'через 59 мин'),
+        @('BV-07.4', (& $cd 3600), 'через 1 ч 0 мин'), @('BV-07.5', (& $cd 3601), 'через 1 ч 0 мин'),
+        @('BV-08.1', (& $cd 86399), 'через 23 ч 59 мин'), @('BV-08.2', (& $cd 86400), 'через 1 д 0 ч'), @('BV-08.3', (& $cd 86401), 'через 1 д 0 ч'),
+        @('BV-09.1', (& $ev 79.9 ($N + 3600)), '—'), @('BV-09.2', (& $ev 80 ($N + 3600)), '80'), @('BV-09.3', (& $ev 80.1 ($N + 3600)), '80'),
+        @('BV-10.1', (& $ev 94.9 ($N + 3600)), '80'), @('BV-10.2', (& $ev 95 ($N + 3600)), '95'), @('BV-10.3', (& $ev 95.1 ($N + 3600)), '95'),
+        @('BV-11.1', (& $ev 99.9 ($N + 3600) $null @(100, 95, 80)), '95'), @('BV-11.2', (& $ev 100 ($N + 3600) $null @(100, 95, 80)), '100'),
+        @('BV-11.3', (& $ev 101 ($N + 3600) $null @(100, 95, 80)), '100'),
+        @('BV-12.1', (& $ev 79.9 ($N - 10)), '—'), @('BV-12.2', (& $ev 80 ($N - 10)), 'reset'), @('BV-12.3', (& $ev 80.1 ($N - 10)), 'reset'),
+        @('BV-13.1', (& $ev 90 ($N - 899)), 'reset'), @('BV-13.2', (& $ev 90 ($N - 900)), '—'), @('BV-13.3', (& $ev 90 ($N - 901)), '—'),
+        @('BV-14.1', (& $ev 85 ($N + 3600) @{ 'five_hour:80' = [double]($N + 3600 - 1799) }), '—'),
+        @('BV-14.2', (& $ev 85 ($N + 3600) @{ 'five_hour:80' = [double]($N + 3600 - 1800) }), '80'),
+        @('BV-14.3', (& $ev 85 ($N + 3600) @{ 'five_hour:80' = [double]($N + 3600 - 1801) }), '80'),
+        @('BV-15.1', (Test-PhoneShouldSend 'b' 'a' ($N - 59) 0 $N), $false), @('BV-15.2', (Test-PhoneShouldSend 'b' 'a' ($N - 60) 0 $N), $true),
+        @('BV-15.3', (Test-PhoneShouldSend 'b' 'a' ($N - 61) 0 $N), $true),
+        @('BV-16.1', (Test-PhoneShouldSend 'b' 'a' 0 ($N - 299) $N), $false), @('BV-16.2', (Test-PhoneShouldSend 'b' 'a' 0 ($N - 300) $N), $true),
+        @('BV-16.3', (Test-PhoneShouldSend 'b' 'a' 0 ($N - 301) $N), $true),
+        @('BV-20.1', (Test-NewerVersion '2.0.9' '2.1.0'), $false), @('BV-20.2', (Test-NewerVersion '2.1.0' '2.1.0'), $false),
+        @('BV-20.3', (Test-NewerVersion '2.1.1' '2.1.0'), $true)
+    )
+    foreach ($c in $cases) { Eq ([string]$c[1]) ([string]$c[2]) "$($c[0]):" }
+    Write-Host "   граничных значений проверено: $($cases.Count)"
+}
+
 # ============================================================ 4. Только Windows
 if ($OnWindows) {
     Write-Host '== Установка / значок / удаление (Windows)'
